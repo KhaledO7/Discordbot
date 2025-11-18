@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, date
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
+
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -33,6 +35,8 @@ AVAILABLE_ROLE_ID = _safe_int_env("AVAILABLE_ROLE_ID")
 TEAM_A_ROLE_ID = _safe_int_env("TEAM_A_ROLE_ID")
 TEAM_B_ROLE_ID = _safe_int_env("TEAM_B_ROLE_ID")
 AUTO_RESET_DAY = os.getenv("AUTO_RESET_DAY", "monday").lower()
+DEFAULT_SCRIM_START_TIME = os.getenv("DEFAULT_SCRIM_START_TIME", "7:00 PM")
+SCRIM_TIMEZONE = os.getenv("SCRIM_TIMEZONE", "America/New_York")
 
 try:
     parsed_hour = int(os.getenv("AUTO_RESET_HOUR", "8"))
@@ -54,6 +58,21 @@ def parse_days(raw: str) -> List[str]:
     segments = (segment.strip() for segment in raw.split(","))
     normalized = (normalize_day(segment) for segment in segments if segment)
     return [day for day in normalized if day]
+
+
+def parse_time_string(raw: str) -> Optional[time]:
+    cleaned = raw.strip()
+    for fmt in ("%H:%M", "%I:%M %p", "%I %p", "%I:%M%p"):
+        try:
+            return datetime.strptime(cleaned, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def format_time_with_zone(target_date: date, scrim_time: time, tz: ZoneInfo) -> str:
+    start_dt = datetime.combine(target_date, scrim_time, tzinfo=tz)
+    return start_dt.strftime("%I:%M %p %Z").lstrip("0")
 
 
 @lru_cache(maxsize=1)
@@ -80,6 +99,47 @@ def infer_team(
         return "A"
     if team_b_id and team_b_id in member_role_ids:
         return "B"
+    return None
+
+
+def resolve_scrim_timezone(config_store: GuildConfigStore, guild_id: int) -> ZoneInfo:
+    timezone_name = config_store.get_scrim_timezone(guild_id) or SCRIM_TIMEZONE
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        logging.warning("Invalid timezone %s, defaulting to UTC", timezone_name)
+        return ZoneInfo("UTC")
+
+
+def resolve_scrim_time(config_store: GuildConfigStore, guild_id: int, day: str) -> time:
+    raw_time = config_store.get_scrim_time(guild_id, day) or DEFAULT_SCRIM_START_TIME
+    parsed = parse_time_string(raw_time)
+    if parsed:
+        return parsed
+    logging.warning("Invalid scrim time '%s'; defaulting to 19:00", raw_time)
+    return time(hour=19, minute=0)
+
+
+def resolve_announcement_channel_id(
+    guild: discord.Guild, config_store: GuildConfigStore
+) -> Optional[int]:
+    configured = config_store.get_announcement_channel(guild.id)
+    if configured:
+        return configured
+    if ANNOUNCEMENT_CHANNEL_ID:
+        return ANNOUNCEMENT_CHANNEL_ID
+    return None
+
+
+def resolve_ping_mention(guild: discord.Guild, config_store: GuildConfigStore) -> Optional[str]:
+    configured_role_id = config_store.get_ping_role(guild.id) or (
+        AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None
+    )
+    if not configured_role_id:
+        return None
+    role = guild.get_role(configured_role_id)
+    if role:
+        return role.mention
     return None
 
 
@@ -310,7 +370,9 @@ class ScheduleCog(commands.Cog):
         text = ScheduleBuilder.format_schedule(summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
 
-        channel_id = self._resolve_announcement_channel_id(interaction.guild)
+        channel_id = resolve_announcement_channel_id(
+            interaction.guild, self.config_store
+        )
         if not channel_id:
             await interaction.response.send_message(
                 "No announcement channel configured. Use /config announcement first.",
@@ -323,29 +385,10 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Announcement channel not found.", ephemeral=True)
             return
 
-        mention = self._resolve_ping_mention(interaction.guild)
+        mention = resolve_ping_mention(interaction.guild, self.config_store)
         content = f"{mention} Weekly schedule updated!" if mention else "Weekly schedule updated!"
         await channel.send(content=content, embed=embed)
         await interaction.response.send_message("Schedule posted!", ephemeral=True)
-
-    def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
-        configured = self.config_store.get_announcement_channel(guild.id)
-        if configured:
-            return configured
-        if ANNOUNCEMENT_CHANNEL_ID:
-            return ANNOUNCEMENT_CHANNEL_ID
-        return None
-
-    def _resolve_ping_mention(self, guild: discord.Guild) -> Optional[str]:
-        configured_role_id = self.config_store.get_ping_role(guild.id) or (
-            AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None
-        )
-        if not configured_role_id:
-            return None
-        role = guild.get_role(configured_role_id)
-        if role:
-            return role.mention
-        return None
 
 
 class ConfigCog(commands.Cog):
@@ -411,6 +454,58 @@ class ConfigCog(commands.Cog):
             parts.append(f"Team B → {team_b.mention}")
         await interaction.response.send_message(
             "Saved team roles: " + ", ".join(parts), ephemeral=True
+        )
+
+    @config.command(
+        name="scrimtime",
+        description="Set the scrim start time for a specific weekday (24h or AM/PM)",
+    )
+    @app_commands.describe(
+        day="Day of week (e.g. friday)",
+        time_of_day="Start time like 19:00 or 7:00 PM",
+        timezone="Optional IANA timezone (e.g. America/New_York)",
+    )
+    async def config_scrim_time(
+        self,
+        interaction: discord.Interaction,
+        day: str,
+        time_of_day: str,
+        timezone: Optional[str] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        normalized_day = normalize_day(day)
+        if not normalized_day:
+            await interaction.response.send_message("Provide a valid weekday.", ephemeral=True)
+            return
+
+        parsed_time = parse_time_string(time_of_day)
+        if not parsed_time:
+            await interaction.response.send_message(
+                "Provide a valid start time like `19:00` or `7:00 PM`.",
+                ephemeral=True,
+            )
+            return
+
+        tz = resolve_scrim_timezone(self.config_store, interaction.guild.id)
+        if timezone:
+            try:
+                tz = ZoneInfo(timezone)
+            except Exception:
+                await interaction.response.send_message(
+                    "Invalid timezone. Use an IANA timezone like `America/New_York`.",
+                    ephemeral=True,
+                )
+                return
+            self.config_store.set_scrim_timezone(interaction.guild.id, timezone)
+
+        self.config_store.set_scrim_time(interaction.guild.id, normalized_day, time_of_day)
+        formatted_time = format_time_with_zone(date.today(), parsed_time, tz)
+        await interaction.response.send_message(
+            f"Scrim time for **{normalized_day.title()}** set to {formatted_time}.",
+            ephemeral=True,
         )
 
 
@@ -489,6 +584,78 @@ class AutoResetter(commands.Cog):
                 logging.warning("Failed to announce reset in guild %s", guild.name)
 
 
+class ScrimNotifier(commands.Cog):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self.sent_notifications: Dict[int, Dict[str, date]] = {}
+
+    def cog_unload(self) -> None:
+        if self.scrim_check_task.is_running():
+            self.scrim_check_task.cancel()
+
+    async def cog_load(self) -> None:
+        if not self.scrim_check_task.is_running():
+            self.scrim_check_task.start()
+
+    @tasks.loop(minutes=5)
+    async def scrim_check_task(self) -> None:
+        for guild in self.bot.guilds:
+            await self._maybe_ping_guild(guild)
+
+    @scrim_check_task.before_loop
+    async def before_scrim_check_task(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _maybe_ping_guild(self, guild: discord.Guild) -> None:
+        tz = resolve_scrim_timezone(self.config_store, guild.id)
+        now = datetime.now(tz)
+        day = WEEK_DAYS[now.weekday()]
+        start_time = resolve_scrim_time(self.config_store, guild.id, day)
+        start_dt = datetime.combine(now.date(), start_time, tzinfo=tz)
+        notify_dt = start_dt - timedelta(minutes=30)
+
+        if not (notify_dt <= now < start_dt):
+            return
+        if self._already_notified(guild.id, day, now.date()):
+            return
+
+        users = self.availability_store.users_for_day(day)
+        if len(users) < 10:
+            return
+
+        channel_id = resolve_announcement_channel_id(guild, self.config_store)
+        if not channel_id:
+            return
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return
+
+        mention = resolve_ping_mention(guild, self.config_store)
+        mention_prefix = f"{mention} " if mention else ""
+        formatted_time = format_time_with_zone(now.date(), start_time, tz)
+        try:
+            await channel.send(
+                f"{mention_prefix}Scrim ready for **{day.title()}**! {len(users)} players signed up. "
+                f"Scrim starts at {formatted_time}. This is your 30-minute warning."
+            )
+            self._mark_notified(guild.id, day, now.date())
+        except discord.HTTPException:
+            logging.warning("Failed to post scrim reminder in guild %s", guild.name)
+
+    def _already_notified(self, guild_id: int, day: str, today: date) -> bool:
+        return self.sent_notifications.get(guild_id, {}).get(day) == today
+
+    def _mark_notified(self, guild_id: int, day: str, today: date) -> None:
+        self.sent_notifications.setdefault(guild_id, {})[day] = today
+
+
 class ValorantBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -503,6 +670,7 @@ class ValorantBot(commands.Bot):
         await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
         await self.add_cog(ConfigCog(self, self.config_store))
         await self.add_cog(AutoResetter(self, self.availability_store, self.config_store))
+        await self.add_cog(ScrimNotifier(self, self.availability_store, self.config_store))
 
         try:
             synced = await self.tree.sync()

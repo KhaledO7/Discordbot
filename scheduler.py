@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -23,7 +24,7 @@ PREMIER_WINDOWS = {
     "sunday": "7:00-8:00 PM ET",
 }
 
-DEFAULT_SCRIM_TIME = "7:00 PM ET"
+DEFAULT_SCRIM_TIME = os.getenv("DEFAULT_SCRIM_START_TIME", "7:00 PM")
 
 
 @dataclass
@@ -103,7 +104,7 @@ class ScheduleBuilder:
     def format_schedule(summaries: List[DaySummary]) -> str:
         header = (
             "Valorant Availability — Premier Wed-Sun (7-8 PM ET, Fri/Sat 8-9 PM ET) | "
-            f"Scrims target {DEFAULT_SCRIM_TIME} if 10+ players"
+            f"Scrims target configured times (default {DEFAULT_SCRIM_TIME}) if 10+ players"
         )
         lines = [header, ""]
         for summary in summaries:
