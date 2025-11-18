@@ -6,6 +6,7 @@ A lightweight Discord bot for managing Valorant Premier nights and 5v5 scrim ava
 - Slash commands for collecting player availability (with optional Team A/B tagging).
 - Automatic weekly summary showing Premier readiness (needs 5 from a single team) and scrim readiness (needs 10 total).
 - Posts the schedule into an announcement channel and optionally pings a configured role.
+- Automatic scrim reminders that fire 30 minutes before the configured start time when 10+ players are available.
 - Quick signup select menu with a built-in clear button so players can update availability without typing commands.
 - Optional weekly auto-reset so availability clears on a chosen day/hour (default: Mondays at 8 AM server time).
 - Simple JSON persistence—no external database required.
@@ -14,7 +15,7 @@ A lightweight Discord bot for managing Valorant Premier nights and 5v5 scrim ava
 - Premier runs **Wednesday–Sunday**.
   - **Wednesday/Thursday/Sunday:** 7–8 PM ET
   - **Friday/Saturday:** 8–9 PM ET
-- Scrims target **7 PM ET** on any day where 10+ players are available.
+- Scrims target **the configured start time** (default 7 PM in your configured timezone) on any day where 10+ players are available.
 
 ## Quick start (Version 2)
 Follow these steps to get the bot running—no code moves required. Run all commands from the repository root.
@@ -37,6 +38,9 @@ TEAM_B_ROLE_ID=456789012345678901
 # Optional: weekly availability reset cadence (server-local time)
 AUTO_RESET_DAY=monday
 AUTO_RESET_HOUR=8
+# Optional: default scrim start time and timezone (used unless overridden via /config scrimtime)
+DEFAULT_SCRIM_START_TIME="7:00 PM"
+SCRIM_TIMEZONE="America/New_York"
 ```
 
 ### 3) Install and run
@@ -74,6 +78,7 @@ Once the bot is online, run these slash commands in your server:
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
 - `/config pingrole role:<@role>` — set the role to mention when posting schedules.
 - `/config teamroles [team_a:<@role>] [team_b:<@role>]` — set Team A/B role IDs for accurate detection.
+- `/config scrimtime day:<weekday> time:<19:00|7:00 PM> [timezone:<America/New_York>]` — set the scrim start time and optional timezone for a specific day.
 
 ## Data Storage
 Availability and guild configuration are stored as JSON under `data/`. The directory is created automatically on first run; the files can be safely deleted to reset state.

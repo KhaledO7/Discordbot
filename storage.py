@@ -122,6 +122,23 @@ class GuildConfigStore:
             guild_data["team_b_role_id"] = team_b_role_id
         self._persist()
 
+    def set_scrim_time(self, guild_id: int, day: str, time_str: str) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        times = guild_data.setdefault("scrim_times", {})
+        times[day] = time_str
+        self._persist()
+
+    def get_scrim_time(self, guild_id: int, day: str) -> Optional[str]:
+        return self._data.get(str(guild_id), {}).get("scrim_times", {}).get(day)
+
+    def set_scrim_timezone(self, guild_id: int, timezone: str) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        guild_data["scrim_timezone"] = timezone
+        self._persist()
+
+    def get_scrim_timezone(self, guild_id: int) -> Optional[str]:
+        return self._data.get(str(guild_id), {}).get("scrim_timezone")
+
     def get_announcement_channel(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("announcement_channel_id")
 
