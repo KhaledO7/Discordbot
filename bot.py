@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime, date
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -126,6 +126,7 @@ class AvailabilityClearButton(discord.ui.Button):
             return
 
         self.cog.availability_store.clear_user(member.id)
+        await self.cog._sync_member_role(member)
         await interaction.response.send_message("Cleared your availability for the week.", ephemeral=True)
 
 
@@ -142,10 +143,12 @@ class AvailabilityCog(commands.Cog):
         bot: commands.Bot,
         availability_store: AvailabilityStore,
         config_store: GuildConfigStore,
+        role_manager: "AvailabilityRoleManager | None" = None,
     ) -> None:
         self.bot = bot
         self.availability_store = availability_store
         self.config_store = config_store
+        self.role_manager = role_manager
 
     availability = app_commands.Group(name="availability", description="Manage Valorant availability")
 
@@ -165,7 +168,13 @@ class AvailabilityCog(commands.Cog):
             team=normalized_team,
             days=normalized_days,
         )
+        await self._sync_member_role(member)
         return normalized_days, normalized_team
+
+    async def _sync_member_role(self, member: discord.Member) -> None:
+        if not self.role_manager:
+            return
+        await self.role_manager.sync_member(member)
 
     @availability.command(name="set", description="Set the days you can play this week")
     @app_commands.describe(days="Comma-separated days (e.g. wed, thu, sat)", team="Optional team override (A or B)")
@@ -201,6 +210,7 @@ class AvailabilityCog(commands.Cog):
             return
 
         self.availability_store.clear_user(member.id)
+        await self._sync_member_role(member)
         await interaction.response.send_message("Availability cleared!", ephemeral=True)
 
     @availability.command(name="mine", description="View your saved availability")
@@ -274,6 +284,8 @@ class AvailabilityCog(commands.Cog):
             return
 
         cleared = self.availability_store.reset_all()
+        if self.role_manager:
+            await self.role_manager.clear_roles_for_all_guilds()
         await interaction.response.send_message(
             f"Cleared availability for {cleared} players. Fresh week ready!", ephemeral=True
         )
@@ -337,8 +349,10 @@ class ScheduleCog(commands.Cog):
         return None
 
     def _resolve_ping_mention(self, guild: discord.Guild) -> Optional[str]:
-        configured_role_id = self.config_store.get_ping_role(guild.id) or (
-            AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None
+        configured_role_id = (
+            self.config_store.get_ping_role(guild.id)
+            or self.config_store.get_availability_role(guild.id)
+            or (AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None)
         )
         if not configured_role_id:
             return None
@@ -378,6 +392,23 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(f"Ping role set to {role.mention}", ephemeral=True)
 
     @config.command(
+        name="availablerole",
+        description="Set the role granted to members available today",
+    )
+    @app_commands.describe(role="Role that should be granted to available members")
+    async def config_availability_role(
+        self, interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.config_store.set_availability_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"Availability role set to {role.mention}", ephemeral=True
+        )
+
+    @config.command(
         name="teamroles",
         description="Set the Discord roles that map to Team A and Team B",
     )
@@ -414,7 +445,7 @@ class ConfigCog(commands.Cog):
         )
 
 
-class AutoResetter(commands.Cog):
+class AvailabilityRoleManager(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
@@ -424,6 +455,120 @@ class AutoResetter(commands.Cog):
         self.bot = bot
         self.availability_store = availability_store
         self.config_store = config_store
+
+    def cog_unload(self) -> None:
+        if self.sync_roles_task.is_running():
+            self.sync_roles_task.cancel()
+
+    async def cog_load(self) -> None:
+        if not self.sync_roles_task.is_running():
+            self.sync_roles_task.start()
+
+    @tasks.loop(minutes=60)
+    async def sync_roles_task(self) -> None:
+        await self.sync_all_guilds()
+
+    @sync_roles_task.before_loop
+    async def before_sync_roles_task(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def sync_all_guilds(self) -> None:
+        today_ids = self._today_user_ids()
+        for guild in self.bot.guilds:
+            await self._sync_guild_roles(guild, today_ids)
+
+    async def sync_member(self, member: discord.Member) -> None:
+        today_ids = self._today_user_ids()
+        await self._apply_role(member, today_ids)
+
+    async def clear_roles_for_all_guilds(self) -> None:
+        for guild in self.bot.guilds:
+            role = self._resolve_role(guild)
+            if not role:
+                continue
+            for member in guild.members:
+                if role in member.roles:
+                    await self._remove_role(member, role)
+
+    async def _sync_guild_roles(self, guild: discord.Guild, today_ids: Set[int]) -> None:
+        role = self._resolve_role(guild)
+        if not role:
+            return
+        for member in guild.members:
+            await self._apply_role(member, today_ids, role)
+
+    async def _apply_role(
+        self,
+        member: discord.Member,
+        today_ids: Set[int],
+        role: Optional[discord.Role] = None,
+    ) -> None:
+        if not member.guild:
+            return
+        resolved_role = role or self._resolve_role(member.guild)
+        if not resolved_role:
+            return
+        should_have = member.id in today_ids
+        has_role = resolved_role in member.roles
+        try:
+            if should_have and not has_role:
+                await member.add_roles(
+                    resolved_role, reason="Marked available for today's schedule"
+                )
+            elif not should_have and has_role:
+                await member.remove_roles(
+                    resolved_role, reason="Not marked available for today"
+                )
+        except discord.Forbidden:
+            logging.warning(
+                "Missing permissions to manage availability role in guild %s", member.guild
+            )
+        except discord.HTTPException:
+            logging.warning("Failed to update availability role for %s", member.display_name)
+
+    async def _remove_role(self, member: discord.Member, role: discord.Role) -> None:
+        if role not in member.roles:
+            return
+        try:
+            await member.remove_roles(role, reason="Availability cleared")
+        except discord.Forbidden:
+            logging.warning(
+                "Missing permissions to remove availability role in guild %s", member.guild
+            )
+        except discord.HTTPException:
+            logging.warning("Failed to remove availability role for %s", member.display_name)
+
+    def _today_user_ids(self) -> Set[int]:
+        today = WEEK_DAYS[datetime.now().weekday()]
+        return {info["id"] for info in self.availability_store.users_for_day(today)}
+
+    def _resolve_role(self, guild: discord.Guild) -> Optional[discord.Role]:
+        role_id = self._resolve_role_id(guild)
+        if not role_id:
+            return None
+        return guild.get_role(role_id)
+
+    def _resolve_role_id(self, guild: discord.Guild) -> Optional[int]:
+        configured = self.config_store.get_availability_role(guild.id)
+        if configured:
+            return configured
+        if AVAILABLE_ROLE_ID:
+            return AVAILABLE_ROLE_ID
+        return self.config_store.get_ping_role(guild.id)
+
+
+class AutoResetter(commands.Cog):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+        role_manager: "AvailabilityRoleManager | None" = None,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self.role_manager = role_manager
         self._target_weekday = self._resolve_reset_weekday()
         self.last_reset_date: Optional[date] = None
 
@@ -468,6 +613,8 @@ class AutoResetter(commands.Cog):
         cleared = self.availability_store.reset_all()
         self.last_reset_date = now.date()
         logging.info("Auto-reset availability for new week; cleared %d users", cleared)
+        if self.role_manager:
+            await self.role_manager.clear_roles_for_all_guilds()
         await self._announce_reset(cleared)
 
     async def _announce_reset(self, cleared: int) -> None:
@@ -499,10 +646,22 @@ class ValorantBot(commands.Bot):
         self.config_store = GuildConfigStore()
 
     async def setup_hook(self) -> None:  # type: ignore[override]
-        await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
+        role_manager = AvailabilityRoleManager(
+            self, self.availability_store, self.config_store
+        )
+        await self.add_cog(role_manager)
+        await self.add_cog(
+            AvailabilityCog(
+                self, self.availability_store, self.config_store, role_manager
+            )
+        )
         await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
         await self.add_cog(ConfigCog(self, self.config_store))
-        await self.add_cog(AutoResetter(self, self.availability_store, self.config_store))
+        await self.add_cog(
+            AutoResetter(
+                self, self.availability_store, self.config_store, role_manager
+            )
+        )
 
         try:
             synced = await self.tree.sync()

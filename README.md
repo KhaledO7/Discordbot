@@ -73,6 +73,7 @@ Once the bot is online, run these slash commands in your server:
 - `/schedule post` — send the schedule to the configured announcement channel and ping the availability role if set.
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
 - `/config pingrole role:<@role>` — set the role to mention when posting schedules.
+- `/config availablerole role:<@role>` — set the role to grant daily to players marked available today (falls back to `AVAILABLE_ROLE_ID` or the ping role).
 - `/config teamroles [team_a:<@role>] [team_b:<@role>]` — set Team A/B role IDs for accurate detection.
 
 ## Data Storage
