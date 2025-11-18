@@ -15,13 +15,30 @@ from storage import AvailabilityStore, GuildConfigStore
 
 logging.basicConfig(level=logging.INFO)
 
+def _safe_int_env(var_name: str) -> Optional[int]:
+    raw = os.getenv(var_name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("Ignoring non-numeric value for %s: %s", var_name, raw)
+        return None
+
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ANNOUNCEMENT_CHANNEL_ID = os.getenv("ANNOUNCEMENT_CHANNEL_ID")
-AVAILABLE_ROLE_ID = os.getenv("AVAILABLE_ROLE_ID")
-TEAM_A_ROLE_ID = os.getenv("TEAM_A_ROLE_ID")
-TEAM_B_ROLE_ID = os.getenv("TEAM_B_ROLE_ID")
+ANNOUNCEMENT_CHANNEL_ID = _safe_int_env("ANNOUNCEMENT_CHANNEL_ID")
+AVAILABLE_ROLE_ID = _safe_int_env("AVAILABLE_ROLE_ID")
+TEAM_A_ROLE_ID = _safe_int_env("TEAM_A_ROLE_ID")
+TEAM_B_ROLE_ID = _safe_int_env("TEAM_B_ROLE_ID")
 AUTO_RESET_DAY = os.getenv("AUTO_RESET_DAY", "monday").lower()
-AUTO_RESET_HOUR = int(os.getenv("AUTO_RESET_HOUR", "8"))
+
+try:
+    parsed_hour = int(os.getenv("AUTO_RESET_HOUR", "8"))
+    AUTO_RESET_HOUR = parsed_hour if 0 <= parsed_hour <= 23 else 8
+except ValueError:
+    logging.warning("AUTO_RESET_HOUR is not a number; defaulting to 8")
+    AUTO_RESET_HOUR = 8
 
 
 def normalize_day(day: str) -> Optional[str]:
@@ -41,8 +58,8 @@ def parse_days(raw: str) -> List[str]:
 @lru_cache(maxsize=1)
 def env_team_roles() -> Tuple[Optional[int], Optional[int]]:
     return (
-        int(TEAM_A_ROLE_ID) if TEAM_A_ROLE_ID else None,
-        int(TEAM_B_ROLE_ID) if TEAM_B_ROLE_ID else None,
+        TEAM_A_ROLE_ID,
+        TEAM_B_ROLE_ID,
     )
 
 
@@ -315,12 +332,12 @@ class ScheduleCog(commands.Cog):
         if configured:
             return configured
         if ANNOUNCEMENT_CHANNEL_ID:
-            return int(ANNOUNCEMENT_CHANNEL_ID)
+            return ANNOUNCEMENT_CHANNEL_ID
         return None
 
     def _resolve_ping_mention(self, guild: discord.Guild) -> Optional[str]:
         configured_role_id = self.config_store.get_ping_role(guild.id) or (
-            int(AVAILABLE_ROLE_ID) if AVAILABLE_ROLE_ID else None
+            AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None
         )
         if not configured_role_id:
             return None
@@ -428,7 +445,7 @@ class AutoResetter(commands.Cog):
         if configured:
             return configured
         if ANNOUNCEMENT_CHANNEL_ID:
-            return int(ANNOUNCEMENT_CHANNEL_ID)
+            return ANNOUNCEMENT_CHANNEL_ID
         return None
 
     @tasks.loop(minutes=30)
