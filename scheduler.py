@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 from typing import Dict, List, Optional
 
-from storage import AvailabilityStore, GuildConfigStore
-from time_utils import format_time_with_zone, parse_time_string
+from storage import AvailabilityStore
 
 WEEK_DAYS = [
     "monday",
@@ -18,7 +16,7 @@ WEEK_DAYS = [
 ]
 
 # Default premier windows – can later be overridden by config
-PREMIER_WINDOWS = {
+PREMIER_WINDOWS: Dict[str, str] = {
     "wednesday": "7:00-8:00 PM ET",
     "thursday": "7:00-8:00 PM ET",
     "friday": "8:00-9:00 PM ET",
@@ -37,7 +35,6 @@ class DaySummary:
     premier_team: Optional[str]
     premier_window: Optional[str]
     scrim_ready: bool
-    scrim_time_display: str
     available_names: List[str]
 
     def to_line(self) -> str:
@@ -65,11 +62,8 @@ class DaySummary:
 
 
 class ScheduleBuilder:
-    def __init__(
-        self, availability_store: AvailabilityStore, config_store: GuildConfigStore
-    ) -> None:
+    def __init__(self, availability_store: AvailabilityStore) -> None:
         self.availability_store = availability_store
-        self.config_store = config_store
 
     def build_week(
         self,
@@ -84,9 +78,6 @@ class ScheduleBuilder:
         windows = premier_windows or PREMIER_WINDOWS
 
         summaries: List[DaySummary] = []
-        timezone = self.config_store.resolve_timezone(guild_id, DEFAULT_TIMEZONE)
-        today = date.today()
-
         for day in WEEK_DAYS:
             users = self.availability_store.users_for_day(day)
             team_counts: Dict[str, int] = {"A": 0, "B": 0}
@@ -102,12 +93,6 @@ class ScheduleBuilder:
             premier_team = self._select_premier_team(team_counts) if premier_window else None
             scrim_ready = len(users) >= 10
 
-            scrim_time_str = self.config_store.get_scrim_time(guild_id, day) or DEFAULT_SCRIM_TIME
-            parsed_time = parse_time_string(scrim_time_str) or parse_time_string(DEFAULT_SCRIM_TIME)
-            scrim_time_display = scrim_time_str
-            if parsed_time:
-                scrim_time_display = format_time_with_zone(today, parsed_time, timezone)
-
             summaries.append(
                 DaySummary(
                     day=day,
@@ -116,7 +101,6 @@ class ScheduleBuilder:
                     premier_team=premier_team,
                     premier_window=premier_window,
                     scrim_ready=scrim_ready,
-                    scrim_time_display=scrim_time_display,
                     available_names=names,
                 )
             )
