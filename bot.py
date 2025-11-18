@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, date
@@ -15,13 +16,30 @@ from storage import AvailabilityStore, GuildConfigStore
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ANNOUNCEMENT_CHANNEL_ID = os.getenv("ANNOUNCEMENT_CHANNEL_ID")
-AVAILABLE_ROLE_ID = os.getenv("AVAILABLE_ROLE_ID")
-TEAM_A_ROLE_ID = os.getenv("TEAM_A_ROLE_ID")
-TEAM_B_ROLE_ID = os.getenv("TEAM_B_ROLE_ID")
+
+def _safe_int_env(var_name: str) -> Optional[int]:
+    raw = os.getenv(var_name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("Ignoring non-numeric value for %s: %s", var_name, raw)
+        return None
+
+
+ANNOUNCEMENT_CHANNEL_ID = _safe_int_env("ANNOUNCEMENT_CHANNEL_ID")
+AVAILABLE_ROLE_ID = _safe_int_env("AVAILABLE_ROLE_ID")
+TEAM_A_ROLE_ID = _safe_int_env("TEAM_A_ROLE_ID")
+TEAM_B_ROLE_ID = _safe_int_env("TEAM_B_ROLE_ID")
 AUTO_RESET_DAY = os.getenv("AUTO_RESET_DAY", "monday").lower()
-AUTO_RESET_HOUR = int(os.getenv("AUTO_RESET_HOUR", "8"))
+
+try:
+    parsed_hour = int(os.getenv("AUTO_RESET_HOUR", "8"))
+    AUTO_RESET_HOUR = parsed_hour if 0 <= parsed_hour <= 23 else 8
+except ValueError:
+    logging.warning("AUTO_RESET_HOUR is not a number; defaulting to 8")
+    AUTO_RESET_HOUR = 8
 
 
 def normalize_day(day: str) -> Optional[str]:
@@ -41,8 +59,8 @@ def parse_days(raw: str) -> List[str]:
 @lru_cache(maxsize=1)
 def env_team_roles() -> Tuple[Optional[int], Optional[int]]:
     return (
-        int(TEAM_A_ROLE_ID) if TEAM_A_ROLE_ID else None,
-        int(TEAM_B_ROLE_ID) if TEAM_B_ROLE_ID else None,
+        TEAM_A_ROLE_ID,
+        TEAM_B_ROLE_ID,
     )
 
 
@@ -315,12 +333,12 @@ class ScheduleCog(commands.Cog):
         if configured:
             return configured
         if ANNOUNCEMENT_CHANNEL_ID:
-            return int(ANNOUNCEMENT_CHANNEL_ID)
+            return ANNOUNCEMENT_CHANNEL_ID
         return None
 
     def _resolve_ping_mention(self, guild: discord.Guild) -> Optional[str]:
         configured_role_id = self.config_store.get_ping_role(guild.id) or (
-            int(AVAILABLE_ROLE_ID) if AVAILABLE_ROLE_ID else None
+            AVAILABLE_ROLE_ID if AVAILABLE_ROLE_ID else None
         )
         if not configured_role_id:
             return None
@@ -408,10 +426,14 @@ class AutoResetter(commands.Cog):
         self.config_store = config_store
         self._target_weekday = self._resolve_reset_weekday()
         self.last_reset_date: Optional[date] = None
-        self.auto_reset_task.start()
 
     def cog_unload(self) -> None:
-        self.auto_reset_task.cancel()
+        if self.auto_reset_task.is_running():
+            self.auto_reset_task.cancel()
+
+    async def cog_load(self) -> None:
+        if not self.auto_reset_task.is_running():
+            self.auto_reset_task.start()
 
     def _resolve_reset_weekday(self) -> int:
         try:
@@ -425,7 +447,7 @@ class AutoResetter(commands.Cog):
         if configured:
             return configured
         if ANNOUNCEMENT_CHANNEL_ID:
-            return int(ANNOUNCEMENT_CHANNEL_ID)
+            return ANNOUNCEMENT_CHANNEL_ID
         return None
 
     @tasks.loop(minutes=30)
@@ -467,39 +489,47 @@ class AutoResetter(commands.Cog):
                 logging.warning("Failed to announce reset in guild %s", guild.name)
 
 
-def build_bot() -> commands.Bot:
-    intents = discord.Intents.default()
-    intents.members = True
-    bot = commands.Bot(command_prefix="!", intents=intents)
+class ValorantBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(command_prefix="!", intents=intents)
 
-    availability_store = AvailabilityStore()
-    config_store = GuildConfigStore()
+        self.availability_store = AvailabilityStore()
+        self.config_store = GuildConfigStore()
 
-    bot.add_cog(AvailabilityCog(bot, availability_store, config_store))
-    bot.add_cog(ScheduleCog(bot, availability_store, config_store))
-    bot.add_cog(ConfigCog(bot, config_store))
-    bot.add_cog(AutoResetter(bot, availability_store, config_store))
+    async def setup_hook(self) -> None:  # type: ignore[override]
+        await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
+        await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
+        await self.add_cog(ConfigCog(self, self.config_store))
+        await self.add_cog(AutoResetter(self, self.availability_store, self.config_store))
 
-    @bot.event
-    async def on_ready() -> None:
-        assert bot.user is not None
-        logging.info("Logged in as %s", bot.user)
         try:
-            synced = await bot.tree.sync()
+            synced = await self.tree.sync()
             logging.info("Synced %d app commands", len(synced))
         except discord.HTTPException as exc:
             logging.error("Failed to sync commands: %s", exc)
 
-    return bot
+    async def on_ready(self) -> None:  # type: ignore[override]
+        assert self.user is not None
+        logging.info("Logged in as %s", self.user)
 
 
-def main() -> None:
-    if not TOKEN:
+async def create_bot() -> commands.Bot:
+    return ValorantBot()
+
+
+async def main() -> None:
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is required")
-    bot = build_bot()
-    bot.run(TOKEN)
+
+    bot = await create_bot()
+    try:
+        await bot.start(token)
+    finally:
+        await bot.close()
 
 
 if __name__ == "__main__":
-    main()
-
+    asyncio.run(main())
