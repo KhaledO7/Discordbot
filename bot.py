@@ -13,6 +13,7 @@ from discord.ext import commands, tasks
 
 from scheduler import ScheduleBuilder, WEEK_DAYS, DEFAULT_SCRIM_LABEL, PREMIER_WINDOWS
 from storage import AvailabilityStore, GuildConfigStore
+from time_utils import format_time_with_zone, parse_time_string
 
 logging.basicConfig(level=logging.INFO)
 
@@ -167,6 +168,29 @@ class AvailabilityCog(commands.Cog):
         )
         return normalized_days, normalized_team
 
+    async def _remove_available_role(self, member: discord.Member) -> None:
+        if not member.guild:
+            return
+        role = resolve_available_role(member.guild, self.config_store)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Availability cleared")
+            except discord.HTTPException:
+                logging.warning("Failed to remove available role from %s", member)
+
+    async def _clear_available_role_from_guilds(self) -> None:
+        for guild in self.bot.guilds:
+            role = resolve_available_role(guild, self.config_store)
+            if not role:
+                continue
+            for member in guild.members:
+                if member.bot or role not in member.roles:
+                    continue
+                try:
+                    await member.remove_roles(role, reason="Availability reset")
+                except discord.HTTPException:
+                    logging.warning("Failed to remove available role from %s", member)
+
     @availability.command(name="set", description="Set the days you can play this week")
     @app_commands.describe(days="Comma-separated days (e.g. wed, thu, sat)", team="Optional team override (A or B)")
     async def availability_set(
@@ -201,6 +225,7 @@ class AvailabilityCog(commands.Cog):
             return
 
         self.availability_store.clear_user(member.id)
+        await self._remove_available_role(member)
         await interaction.response.send_message("Availability cleared!", ephemeral=True)
 
     @availability.command(name="mine", description="View your saved availability")
@@ -274,6 +299,7 @@ class AvailabilityCog(commands.Cog):
             return
 
         cleared = self.availability_store.reset_all()
+        await self._clear_available_role_from_guilds()
         await interaction.response.send_message(
             f"Cleared availability for {cleared} players. Fresh week ready!", ephemeral=True
         )
@@ -288,7 +314,7 @@ class ScheduleCog(commands.Cog):
     ) -> None:
         self.bot = bot
         self.availability_store = availability_store
-        self.schedule_builder = ScheduleBuilder(availability_store)
+        self.schedule_builder = ScheduleBuilder(availability_store, config_store)
         self.config_store = config_store
 
     schedule = app_commands.Group(name="schedule", description="Build and post weekly schedules")
@@ -396,6 +422,22 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(f"Ping role set to {role.mention}", ephemeral=True)
 
     @config.command(
+        name="availablerole", description="Set the role granted to players available today"
+    )
+    @app_commands.describe(role="Role to grant and remove based on daily availability")
+    async def config_available_role(
+        self, interaction: discord.Interaction, role: discord.Role
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.config_store.set_available_role(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"Available role set to {role.mention}.", ephemeral=True
+        )
+
+    @config.command(
         name="teamroles",
         description="Set the Discord roles that map to Team A and Team B",
     )
@@ -456,6 +498,28 @@ class ConfigCog(commands.Cog):
         self.config_store.set_scrim_time(interaction.guild.id, time)
         await interaction.response.send_message(
             f"Scrim time set to {time} (server local time).", ephemeral=True
+        )
+
+    @config.command(
+        name="premierwindow", description="Set the premier match window for a weekday"
+    )
+    @app_commands.describe(day="Day of week", window="Premier window like '7:00-8:00 PM ET'")
+    async def config_premier_window(
+        self, interaction: discord.Interaction, day: str, window: str
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        normalized_day = normalize_day(day)
+        if not normalized_day:
+            await interaction.response.send_message("Provide a valid weekday.", ephemeral=True)
+            return
+
+        self.config_store.set_premier_window(interaction.guild.id, normalized_day, window)
+        await interaction.response.send_message(
+            f"Premier window for **{normalized_day.title()}** set to {window}.",
+            ephemeral=True,
         )
 
 
@@ -557,6 +621,17 @@ class AutoResetter(commands.Cog):
         cleared = self.availability_store.reset_all()
         self.last_reset_date = now.date()
         logging.info("Auto-reset availability for new week; cleared %d users", cleared)
+        for guild in self.bot.guilds:
+            role = resolve_available_role(guild, self.config_store)
+            if not role:
+                continue
+            for member in guild.members:
+                if member.bot or role not in member.roles:
+                    continue
+                try:
+                    await member.remove_roles(role, reason="Weekly availability reset")
+                except discord.HTTPException:
+                    logging.warning("Failed to remove available role from %s", member)
         await self._announce_reset(cleared)
 
     async def _announce_reset(self, cleared: int) -> None:
