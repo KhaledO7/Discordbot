@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, date
@@ -11,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from scheduler import ScheduleBuilder, WEEK_DAYS
+from scheduler import DEFAULT_SCRIM_TIME, ScheduleBuilder, WEEK_DAYS
 from storage import AvailabilityStore, GuildConfigStore
 
 logging.basicConfig(level=logging.INFO)
@@ -288,15 +289,18 @@ class ScheduleCog(commands.Cog):
     ) -> None:
         self.bot = bot
         self.availability_store = availability_store
-        self.schedule_builder = ScheduleBuilder(availability_store)
+        self.schedule_builder = ScheduleBuilder(availability_store, config_store)
         self.config_store = config_store
 
     schedule = app_commands.Group(name="schedule", description="Build and post weekly schedules")
 
     @schedule.command(name="preview", description="Preview the current schedule")
     async def schedule_preview(self, interaction: discord.Interaction) -> None:
-        summaries = self.schedule_builder.build_week()
-        text = ScheduleBuilder.format_schedule(summaries)
+        guild_id = interaction.guild.id if interaction.guild else None
+        summaries, premier_windows, scrim_time = self.schedule_builder.build_week(
+            guild_id
+        )
+        text = ScheduleBuilder.format_schedule(summaries, premier_windows, scrim_time)
         embed = format_embed("Valorant Weekly Schedule", text)
         await interaction.response.send_message(embed=embed)
 
@@ -306,8 +310,10 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week()
-        text = ScheduleBuilder.format_schedule(summaries)
+        summaries, premier_windows, scrim_time = self.schedule_builder.build_week(
+            interaction.guild.id
+        )
+        text = ScheduleBuilder.format_schedule(summaries, premier_windows, scrim_time)
         embed = format_embed("Valorant Weekly Schedule", text)
 
         channel_id = self._resolve_announcement_channel_id(interaction.guild)
@@ -411,6 +417,111 @@ class ConfigCog(commands.Cog):
             parts.append(f"Team B → {team_b.mention}")
         await interaction.response.send_message(
             "Saved team roles: " + ", ".join(parts), ephemeral=True
+        )
+
+    @config.command(
+        name="times",
+        description="Configure premier windows and scrim start time",
+    )
+    @app_commands.describe(
+        premier_json="JSON mapping days to premier windows (use null/off to disable)",
+        scrim_time="Scrim start time (e.g. 7:00 PM ET)",
+        wednesday="Premier window for Wednesday",
+        thursday="Premier window for Thursday",
+        friday="Premier window for Friday",
+        saturday="Premier window for Saturday",
+        sunday="Premier window for Sunday",
+    )
+    async def config_times(
+        self,
+        interaction: discord.Interaction,
+        premier_json: Optional[str] = None,
+        scrim_time: Optional[str] = None,
+        wednesday: Optional[str] = None,
+        thursday: Optional[str] = None,
+        friday: Optional[str] = None,
+        saturday: Optional[str] = None,
+        sunday: Optional[str] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        updates: Dict[str, Optional[str]] = {}
+
+        if premier_json:
+            try:
+                payload = json.loads(premier_json)
+            except json.JSONDecodeError:
+                await interaction.response.send_message(
+                    "Invalid JSON. Expecting an object mapping days to windows.",
+                    ephemeral=True,
+                )
+                return
+            if not isinstance(payload, dict):
+                await interaction.response.send_message(
+                    "JSON must be an object mapping day name to time window.",
+                    ephemeral=True,
+                )
+                return
+            for day, window in payload.items():
+                normalized = day.lower()
+                if normalized not in WEEK_DAYS:
+                    await interaction.response.send_message(
+                        f"Unknown day '{day}'. Use names like wednesday/friday.",
+                        ephemeral=True,
+                    )
+                    return
+                updates[normalized] = None if window is None else str(window)
+
+        def add_day(day: str, value: Optional[str]) -> None:
+            if value is None:
+                return
+            cleaned = value.strip()
+            if not cleaned or cleaned.lower() in {"off", "none", "null"}:
+                updates[day] = None
+            else:
+                updates[day] = cleaned
+
+        add_day("wednesday", wednesday)
+        add_day("thursday", thursday)
+        add_day("friday", friday)
+        add_day("saturday", saturday)
+        add_day("sunday", sunday)
+
+        if updates:
+            self.config_store.set_premier_windows(interaction.guild.id, updates)
+
+        if scrim_time is not None:
+            cleaned = scrim_time.strip()
+            self.config_store.set_scrim_time(
+                interaction.guild.id, cleaned if cleaned else None
+            )
+
+        overrides = self.config_store.get_premier_windows(interaction.guild.id)
+        merged = ScheduleBuilder.merge_premier_windows(overrides)
+        premier_summary = ScheduleBuilder.describe_premier_windows(merged)
+        resolved_scrim_time = (
+            self.config_store.get_scrim_time(interaction.guild.id)
+            or DEFAULT_SCRIM_TIME
+        )
+
+        if not updates and scrim_time is None:
+            await interaction.response.send_message(
+                (
+                    "No changes provided. Current settings:\n"
+                    f"Premier: {premier_summary}\nScrim: {resolved_scrim_time}"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            (
+                "Updated schedule times!\n"
+                f"Premier: {premier_summary}\nScrim: {resolved_scrim_time}"
+            ),
+            ephemeral=True,
         )
 
 

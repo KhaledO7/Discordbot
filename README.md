@@ -74,6 +74,7 @@ Once the bot is online, run these slash commands in your server:
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
 - `/config pingrole role:<@role>` — set the role to mention when posting schedules.
 - `/config teamroles [team_a:<@role>] [team_b:<@role>]` — set Team A/B role IDs for accurate detection.
+- `/config times [scrim_time:<text>] [premier_json:<json>] [wednesday:<text>] ...` — override Premier windows (per day or JSON) and scrim start time.
 
 ## Data Storage
 Availability and guild configuration are stored as JSON under `data/`. The directory is created automatically on first run; the files can be safely deleted to reset state.

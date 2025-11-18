@@ -122,6 +122,34 @@ class GuildConfigStore:
             guild_data["team_b_role_id"] = team_b_role_id
         self._persist()
 
+    def set_premier_windows(
+        self, guild_id: int, windows: Dict[str, Optional[str]]
+    ) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        existing = guild_data.get("premier_windows", {})
+
+        for day, window in windows.items():
+            normalized_day = day.lower()
+            if window is None:
+                existing.pop(normalized_day, None)
+            else:
+                existing[normalized_day] = window
+
+        if existing:
+            guild_data["premier_windows"] = existing
+        elif "premier_windows" in guild_data:
+            guild_data.pop("premier_windows", None)
+
+        self._persist()
+
+    def set_scrim_time(self, guild_id: int, scrim_time: Optional[str]) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        if scrim_time:
+            guild_data["scrim_time"] = scrim_time
+        else:
+            guild_data.pop("scrim_time", None)
+        self._persist()
+
     def get_announcement_channel(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("announcement_channel_id")
 
@@ -134,4 +162,10 @@ class GuildConfigStore:
             "A": data.get("team_a_role_id"),
             "B": data.get("team_b_role_id"),
         }
+
+    def get_premier_windows(self, guild_id: int) -> Dict[str, Optional[str]]:
+        return dict(self._data.get(str(guild_id), {}).get("premier_windows", {}))
+
+    def get_scrim_time(self, guild_id: int) -> Optional[str]:
+        return self._data.get(str(guild_id), {}).get("scrim_time")
 
