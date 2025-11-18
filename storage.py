@@ -101,9 +101,26 @@ class GuildConfigStore:
         self._data.setdefault(str(guild_id), {})["ping_role_id"] = role_id
         self._persist()
 
+    def set_team_roles(
+        self, guild_id: int, team_a_role_id: int | None, team_b_role_id: int | None
+    ) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        if team_a_role_id is not None:
+            guild_data["team_a_role_id"] = team_a_role_id
+        if team_b_role_id is not None:
+            guild_data["team_b_role_id"] = team_b_role_id
+        self._persist()
+
     def get_announcement_channel(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("announcement_channel_id")
 
     def get_ping_role(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("ping_role_id")
+
+    def get_team_roles(self, guild_id: int) -> Dict[str, Optional[int]]:
+        data = self._data.get(str(guild_id), {})
+        return {
+            "A": data.get("team_a_role_id"),
+            "B": data.get("team_b_role_id"),
+        }
 

@@ -29,6 +29,9 @@ DISCORD_BOT_TOKEN=YOUR_TOKEN
 # Optional fallbacks if you prefer environment defaults over using /config commands
 ANNOUNCEMENT_CHANNEL_ID=123456789012345678
 AVAILABLE_ROLE_ID=234567890123456789
+# Optional: map Team A/B to Discord role IDs (e.g., if your roles are named "Group A/B")
+TEAM_A_ROLE_ID=345678901234567890
+TEAM_B_ROLE_ID=456789012345678901
 ```
 
 ### 3) Install and run
@@ -44,6 +47,7 @@ AVAILABLE_ROLE_ID=234567890123456789
 Once the bot is online, run these slash commands in your server:
 - `/config announcement channel:<#channel>` — channel where schedules should be posted.
 - `/config pingrole role:<@role>` — role to ping when posting schedules (optional; overrides `AVAILABLE_ROLE_ID`).
+- `/config teamroles [team_a:<@role>] [team_b:<@role>]` — explicitly map Team A/B to role IDs (useful if your roles are named differently, e.g., **Group A/B**).
 - Players run `/availability set days:<wed, thu, sat> [team:<A|B>]` to register for the week.
 - Staff run `/schedule preview` to see availability and `/schedule post` to send the embed (and ping) to announcements.
 
@@ -52,7 +56,7 @@ Once the bot is online, run these slash commands in your server:
 - Re-run `/availability set` each week to refresh player availability.
 
 ## Commands
-- `/availability set days:<wed, thu, sat> [team:<A|B>]` — save your availability (team inferred from roles if omitted).
+- `/availability set days:<wed, thu, sat> [team:<A|B>]` — save your availability (team inferred from configured roles if omitted).
 - `/availability mine` — view your saved days.
 - `/availability clear` — remove your availability.
 - `/availability day day:<weekday>` — list who is available on a given day.
@@ -60,11 +64,12 @@ Once the bot is online, run these slash commands in your server:
 - `/schedule post` — send the schedule to the configured announcement channel and ping the availability role if set.
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
 - `/config pingrole role:<@role>` — set the role to mention when posting schedules.
+- `/config teamroles [team_a:<@role>] [team_b:<@role>]` — set Team A/B role IDs for accurate detection.
 
 ## Data Storage
 Availability and guild configuration are stored as JSON under `data/`. The directory is created automatically on first run; the files can be safely deleted to reset state.
 
 ## Notes & Ideas
-- Team detection falls back to Discord roles named **Team A** or **Team B** (case-insensitive). Users can also override with the `team` argument.
+- Team detection prioritizes configured role IDs (`/config teamroles` or `TEAM_A_ROLE_ID`/`TEAM_B_ROLE_ID`). Users can also override with the `team` argument if needed.
 - The schedule output highlights whether each Premier slot has enough from Team A or B and how many more players are needed for scrims.
 - Extend this bot with buttons or select menus for quicker signups, or add automatic weekly resets based on your practice cadence.

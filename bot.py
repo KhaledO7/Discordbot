@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, Optional
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -16,8 +17,8 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ANNOUNCEMENT_CHANNEL_ID = os.getenv("ANNOUNCEMENT_CHANNEL_ID")
 AVAILABLE_ROLE_ID = os.getenv("AVAILABLE_ROLE_ID")
-TEAM_A_ROLE_NAMES = {"team a", "a"}
-TEAM_B_ROLE_NAMES = {"team b", "b"}
+TEAM_A_ROLE_ID = os.getenv("TEAM_A_ROLE_ID")
+TEAM_B_ROLE_ID = os.getenv("TEAM_B_ROLE_ID")
 
 
 def normalize_day(day: str) -> Optional[str]:
@@ -29,18 +30,34 @@ def normalize_day(day: str) -> Optional[str]:
 
 
 def parse_days(raw: str) -> List[str]:
-    segments = [segment.strip() for segment in raw.split(",")]
-    normalized = [normalize_day(segment) for segment in segments if segment]
+    segments = (segment.strip() for segment in raw.split(","))
+    normalized = (normalize_day(segment) for segment in segments if segment)
     return [day for day in normalized if day]
 
 
-def infer_team(member: discord.Member, fallback: Optional[str]) -> Optional[str]:
+@lru_cache(maxsize=1)
+def env_team_roles() -> Tuple[Optional[int], Optional[int]]:
+    return (
+        int(TEAM_A_ROLE_ID) if TEAM_A_ROLE_ID else None,
+        int(TEAM_B_ROLE_ID) if TEAM_B_ROLE_ID else None,
+    )
+
+
+def infer_team(
+    member: discord.Member,
+    fallback: Optional[str],
+    configured_roles: Dict[str, Optional[int]],
+    env_roles: Tuple[Optional[int], Optional[int]],
+) -> Optional[str]:
     if fallback:
         return fallback.upper()
-    role_names = {role.name.lower() for role in member.roles}
-    if role_names & TEAM_A_ROLE_NAMES:
+
+    member_role_ids = {role.id for role in member.roles}
+    team_a_id = configured_roles.get("A") or env_roles[0]
+    team_b_id = configured_roles.get("B") or env_roles[1]
+    if team_a_id and team_a_id in member_role_ids:
         return "A"
-    if role_names & TEAM_B_ROLE_NAMES:
+    if team_b_id and team_b_id in member_role_ids:
         return "B"
     return None
 
@@ -50,19 +67,29 @@ def format_embed(title: str, description: str) -> discord.Embed:
 
 
 class AvailabilityCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, availability_store: AvailabilityStore) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+    ) -> None:
         self.bot = bot
         self.availability_store = availability_store
+        self.config_store = config_store
 
     availability = app_commands.Group(name="availability", description="Manage Valorant availability")
 
     @availability.command(name="set", description="Set the days you can play this week")
     @app_commands.describe(days="Comma-separated days (e.g. wed, thu, sat)", team="Optional team override (A or B)")
-    async def availability_set(self, interaction: discord.Interaction, days: str, team: Optional[str] = None) -> None:
+    async def availability_set(
+        self, interaction: discord.Interaction, days: str, team: Optional[str] = None
+    ) -> None:
         member = interaction.user
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
+
+        guild_id = member.guild.id if member.guild else None
 
         normalized_days = parse_days(days)
         if not normalized_days:
@@ -71,7 +98,10 @@ class AvailabilityCog(commands.Cog):
             )
             return
 
-        normalized_team = infer_team(member, team)
+        configured_roles = (
+            self.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
+        )
+        normalized_team = infer_team(member, team, configured_roles, env_team_roles())
         self.availability_store.set_availability(
             user_id=member.id,
             display_name=member.display_name,
@@ -230,6 +260,42 @@ class ConfigCog(commands.Cog):
         self.config_store.set_ping_role(interaction.guild.id, role.id)
         await interaction.response.send_message(f"Ping role set to {role.mention}", ephemeral=True)
 
+    @config.command(
+        name="teamroles",
+        description="Set the Discord roles that map to Team A and Team B",
+    )
+    @app_commands.describe(team_a="Role for Team A", team_b="Role for Team B")
+    async def config_team_roles(
+        self,
+        interaction: discord.Interaction,
+        team_a: Optional[discord.Role] = None,
+        team_b: Optional[discord.Role] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        if not team_a and not team_b:
+            await interaction.response.send_message(
+                "Provide at least one role for Team A or Team B.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_team_roles(
+            interaction.guild.id,
+            team_a_role_id=team_a.id if team_a else None,
+            team_b_role_id=team_b.id if team_b else None,
+        )
+
+        parts = []
+        if team_a:
+            parts.append(f"Team A → {team_a.mention}")
+        if team_b:
+            parts.append(f"Team B → {team_b.mention}")
+        await interaction.response.send_message(
+            "Saved team roles: " + ", ".join(parts), ephemeral=True
+        )
+
 
 def build_bot() -> commands.Bot:
     intents = discord.Intents.default()
@@ -239,7 +305,7 @@ def build_bot() -> commands.Bot:
     availability_store = AvailabilityStore()
     config_store = GuildConfigStore()
 
-    bot.add_cog(AvailabilityCog(bot, availability_store))
+    bot.add_cog(AvailabilityCog(bot, availability_store, config_store))
     bot.add_cog(ScheduleCog(bot, availability_store, config_store))
     bot.add_cog(ConfigCog(bot, config_store))
 
