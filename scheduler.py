@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import discord
+
 from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS
 
 
@@ -57,8 +59,13 @@ class ScheduleBuilder:
         self.availability_store = availability_store
         self.config_store = config_store
 
-    def build_week(self, guild_id: int) -> List[DaySummary]:
+    def build_week(self, guild: discord.Guild) -> List[DaySummary]:
         summaries: List[DaySummary] = []
+
+        # Get configured team role IDs for this guild
+        team_roles = self.config_store.get_team_roles(guild.id)
+        team_a_id = team_roles.get("A")
+        team_b_id = team_roles.get("B")
 
         for day in WEEK_DAYS:
             users = self.availability_store.users_for_day(day)
@@ -66,13 +73,31 @@ class ScheduleBuilder:
             names: List[str] = []
 
             for info in users:
-                team = (str(info.get("team") or "")).upper()
-                if team in team_counts:
+                user_id = int(info.get("id"))
+                member = guild.get_member(user_id)
+
+                team: Optional[str] = None
+
+                # Prefer live Discord roles
+                if member is not None:
+                    member_role_ids = {r.id for r in member.roles}
+                    if team_a_id and team_a_id in member_role_ids:
+                        team = "A"
+                    elif team_b_id and team_b_id in member_role_ids:
+                        team = "B"
+                else:
+                    # Fallback to stored team if member not visible (left server, etc.)
+                    stored_team = (str(info.get("team") or "")).upper()
+                    if stored_team in {"A", "B"}:
+                        team = stored_team
+
+                if team in {"A", "B"}:
                     team_counts[team] += 1
+
                 names.append(str(info.get("display_name")))
 
-            premier_window = self.config_store.get_premier_window(guild_id, day)
-            scrim_time = self.config_store.get_scrim_time(guild_id, day)
+            premier_window = self.config_store.get_premier_window(guild.id, day)
+            scrim_time = self.config_store.get_scrim_time(guild.id, day)
 
             premier_team = self._select_premier_team(team_counts) if premier_window else None
 
