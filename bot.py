@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---- Environment helpers ----
 
+
 def _safe_int_env(var_name: str) -> Optional[int]:
     raw = os.getenv(var_name)
     if raw is None:
@@ -241,6 +242,10 @@ class AvailabilityCog(commands.Cog):
             await interaction.response.send_message("Please provide a valid day.", ephemeral=True)
             return
 
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
         users = self.availability_store.users_for_day(normalized)
         if not users:
             await interaction.response.send_message(
@@ -248,7 +253,23 @@ class AvailabilityCog(commands.Cog):
             )
             return
 
-        lines = [f"{user['display_name']} (Team {user.get('team') or 'Not set'})" for user in users]
+        configured_roles = self.config_store.get_team_roles(interaction.guild.id)
+        env_roles = env_team_roles()
+
+        lines: List[str] = []
+        for user in users:
+            display_name = str(user.get("display_name"))
+            member = interaction.guild.get_member(int(user["id"]))
+            if member is not None:
+                team = infer_team(member, None, configured_roles, env_roles)
+            else:
+                # fallback to stored team if member not found
+                stored_team = (str(user.get("team") or "")).upper()
+                team = stored_team if stored_team in {"A", "B"} else None
+
+            team_label = team or "Not set"
+            lines.append(f"{display_name} (Team {team_label})")
+
         embed = format_embed(
             title=f"Availability for {normalized.title()}",
             description="\n".join(lines),
@@ -316,7 +337,7 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week(interaction.guild.id)
+        summaries = self.schedule_builder.build_week(interaction.guild)
         text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
         await interaction.response.send_message(embed=embed)
@@ -327,7 +348,7 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week(interaction.guild.id)
+        summaries = self.schedule_builder.build_week(interaction.guild)
         text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
 
