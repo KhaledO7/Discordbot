@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from datetime import datetime, date
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from scheduler import ScheduleBuilder, WEEK_DAYS, DEFAULT_SCRIM_LABEL, PREMIER_WINDOWS
-from storage import AvailabilityStore, GuildConfigStore
+from scheduler import ScheduleBuilder
+from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS
 
 logging.basicConfig(level=logging.INFO)
 
+# ---------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------
 
 def _safe_int_env(var_name: str) -> Optional[int]:
     raw = os.getenv(var_name)
@@ -28,19 +30,25 @@ def _safe_int_env(var_name: str) -> Optional[int]:
         return None
 
 
-ANNOUNCEMENT_CHANNEL_ID: Optional[int] = _safe_int_env("ANNOUNCEMENT_CHANNEL_ID")
-AVAILABLE_ROLE_ID: Optional[int] = _safe_int_env("AVAILABLE_ROLE_ID")
-TEAM_A_ROLE_ID: Optional[int] = _safe_int_env("TEAM_A_ROLE_ID")
-TEAM_B_ROLE_ID: Optional[int] = _safe_int_env("TEAM_B_ROLE_ID")
-AUTO_RESET_DAY: str = os.getenv("AUTO_RESET_DAY", "monday").lower()
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+ANNOUNCEMENT_CHANNEL_ID = _safe_int_env("ANNOUNCEMENT_CHANNEL_ID")
+AVAILABLE_ROLE_ID = _safe_int_env("AVAILABLE_ROLE_ID")
+TEAM_A_ROLE_ID = _safe_int_env("TEAM_A_ROLE_ID")
+TEAM_B_ROLE_ID = _safe_int_env("TEAM_B_ROLE_ID")
+
+AUTO_RESET_DAY = os.getenv("AUTO_RESET_DAY", "monday").lower()
 try:
     parsed_hour = int(os.getenv("AUTO_RESET_HOUR", "8"))
-    AUTO_RESET_HOUR: int = parsed_hour if 0 <= parsed_hour <= 23 else 8
+    AUTO_RESET_HOUR = parsed_hour if 0 <= parsed_hour <= 23 else 8
 except ValueError:
     logging.warning("AUTO_RESET_HOUR is not a number; defaulting to 8")
     AUTO_RESET_HOUR = 8
 
+
+# ---------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------
 
 def normalize_day(day: str) -> Optional[str]:
     day = day.strip().lower()
@@ -58,10 +66,7 @@ def parse_days(raw: str) -> List[str]:
 
 @lru_cache(maxsize=1)
 def env_team_roles() -> Tuple[Optional[int], Optional[int]]:
-    return (
-        TEAM_A_ROLE_ID,
-        TEAM_B_ROLE_ID,
-    )
+    return TEAM_A_ROLE_ID, TEAM_B_ROLE_ID
 
 
 def infer_team(
@@ -87,11 +92,28 @@ def format_embed(title: str, description: str) -> discord.Embed:
     return discord.Embed(title=title, description=description, color=discord.Color.brand_red())
 
 
+def parse_time_hhmm(time_str: str) -> Optional[Tuple[int, int]]:
+    """Parse 'HH:MM' into (hour, minute). Returns None if invalid."""
+    try:
+        parts = time_str.strip().split(":")
+        if len(parts) != 2:
+            return None
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# Availability UI (select + clear button)
+# ---------------------------------------------------------
+
 class AvailabilitySelect(discord.ui.Select):
     def __init__(self, cog: "AvailabilityCog") -> None:
-        options = [
-            discord.SelectOption(label=day.title(), value=day) for day in WEEK_DAYS
-        ]
+        options = [discord.SelectOption(label=day.title(), value=day) for day in WEEK_DAYS]
         super().__init__(
             placeholder="Pick the days you can play",
             min_values=1,
@@ -136,6 +158,10 @@ class AvailabilityPanelView(discord.ui.View):
         self.add_item(AvailabilityClearButton(cog))
 
 
+# ---------------------------------------------------------
+# Availability Commands
+# ---------------------------------------------------------
+
 class AvailabilityCog(commands.Cog):
     def __init__(
         self,
@@ -167,6 +193,33 @@ class AvailabilityCog(commands.Cog):
         )
         return normalized_days, normalized_team
 
+    async def _sync_member_role_today(self, member: discord.Member, days: List[str]) -> None:
+        """Grant/remove availability role for this member based on today's availability."""
+        if not member.guild:
+            return
+
+        today = WEEK_DAYS[datetime.now().weekday()]
+        guild_id = member.guild.id
+
+        role_id = self.config_store.get_ping_role(guild_id) or AVAILABLE_ROLE_ID
+        if not role_id:
+            return
+
+        role = member.guild.get_role(role_id)
+        if not role:
+            return
+
+        has_role = role in member.roles
+        is_available_today = today in [d.lower() for d in days]
+
+        try:
+            if is_available_today and not has_role:
+                await member.add_roles(role, reason="Marked available today")
+            elif not is_available_today and has_role:
+                await member.remove_roles(role, reason="No longer available today")
+        except discord.HTTPException:
+            logging.warning("Failed to update availability role for %s", member)
+
     @availability.command(name="set", description="Set the days you can play this week")
     @app_commands.describe(days="Comma-separated days (e.g. wed, thu, sat)", team="Optional team override (A or B)")
     async def availability_set(
@@ -185,6 +238,9 @@ class AvailabilityCog(commands.Cog):
             return
 
         normalized_days, normalized_team = await self._save_availability(member, normalized_days, team)
+
+        # Try to instantly sync today's role
+        await self._sync_member_role_today(member, normalized_days)
 
         pretty_days = ", ".join(day.title() for day in normalized_days)
         team_message = normalized_team or "Not set"
@@ -236,7 +292,7 @@ class AvailabilityCog(commands.Cog):
         lines = [f"{user['display_name']} (Team {user.get('team') or 'Not set'})" for user in users]
         embed = format_embed(
             title=f"Availability for {normalized.title()}",
-            description="\\n".join(lines),
+            description="\n".join(lines),
         )
         await interaction.response.send_message(embed=embed)
 
@@ -281,6 +337,10 @@ class AvailabilityCog(commands.Cog):
         )
 
 
+# ---------------------------------------------------------
+# Schedule Commands
+# ---------------------------------------------------------
+
 class ScheduleCog(commands.Cog):
     def __init__(
         self,
@@ -290,36 +350,21 @@ class ScheduleCog(commands.Cog):
     ) -> None:
         self.bot = bot
         self.availability_store = availability_store
-        self.schedule_builder = ScheduleBuilder(availability_store)
         self.config_store = config_store
+        self.builder = ScheduleBuilder(availability_store, config_store)
 
     schedule = app_commands.Group(name="schedule", description="Build and post weekly schedules")
 
-    def _resolve_premier_windows(self, guild: Optional[discord.Guild]) -> Dict[str, str]:
-        if guild is None:
-            return PREMIER_WINDOWS
-        overrides = self.config_store.get_premier_windows(guild.id)
-        windows = PREMIER_WINDOWS.copy()
-        windows.update({k.lower(): v for k, v in overrides.items()})
-        return windows
-
-    def _resolve_scrim_label(self, guild: Optional[discord.Guild]) -> str:
-        if guild is None:
-            return DEFAULT_SCRIM_LABEL
-        # For header, we just show generic label; per-day times are respected in pings.
-        time_str = self.config_store.get_default_scrim_time(guild.id)
-        if not time_str:
-            return DEFAULT_SCRIM_LABEL
-        return f"{time_str} ET"
-
-    @schedule.command(name="preview", description="Preview the current schedule")
+    @schedule.command(name="preview", description="Preview the current weekly schedule")
     async def schedule_preview(self, interaction: discord.Interaction) -> None:
-        windows = self._resolve_premier_windows(interaction.guild)
-        summaries = self.schedule_builder.build_week(premier_windows=windows)
-        scrim_label = self._resolve_scrim_label(interaction.guild)
-        text = ScheduleBuilder.format_schedule(summaries, scrim_label=scrim_label)
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        summaries = self.builder.build_week(interaction.guild.id)
+        text = ScheduleBuilder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @schedule.command(name="post", description="Post the schedule to the announcement channel")
     async def schedule_post(self, interaction: discord.Interaction) -> None:
@@ -327,22 +372,20 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        windows = self._resolve_premier_windows(interaction.guild)
-        summaries = self.schedule_builder.build_week(premier_windows=windows)
-        scrim_label = self._resolve_scrim_label(interaction.guild)
-        text = ScheduleBuilder.format_schedule(summaries, scrim_label=scrim_label)
+        summaries = self.builder.build_week(interaction.guild.id)
+        text = ScheduleBuilder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
 
         channel_id = self._resolve_announcement_channel_id(interaction.guild)
         if not channel_id:
             await interaction.response.send_message(
-                "No announcement channel configured. Use /config announcement first.",
+                "No announcement channel configured. Use `/config announcement` first.",
                 ephemeral=True,
             )
             return
 
         channel = interaction.guild.get_channel(channel_id)
-        if not channel:
+        if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Announcement channel not found.", ephemeral=True)
             return
 
@@ -351,20 +394,62 @@ class ScheduleCog(commands.Cog):
         await channel.send(content=content, embed=embed)
         await interaction.response.send_message("Schedule posted!", ephemeral=True)
 
+    @schedule.command(name="check_times", description="Show configured scrim and premier times")
+    async def schedule_check_times(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        lines: List[str] = ["**Scrim Times (HH:MM ET)**", ""]
+        for day in WEEK_DAYS:
+            scrim = self.config_store.get_scrim_time(guild_id, day)
+            lines.append(f"- {day.title()}: `{scrim}`" if scrim else f"- {day.title()}: Off")
+
+        lines.append("\n**Premier Windows**\n")
+        for day in WEEK_DAYS:
+            window = self.config_store.get_premier_window(guild_id, day)
+            lines.append(f"- {day.title()}: `{window}`" if window else f"- {day.title()}: Off")
+
+        embed = format_embed("Configured Times", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @schedule.command(
+        name="reset_schedule",
+        description="Reset scrim and premier times back to their default schedule",
+    )
+    async def schedule_reset_schedule(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        if not member.guild_permissions.manage_guild and not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need Manage Server permissions to reset the schedule.", ephemeral=True
+            )
+            return
+
+        self.config_store.reset_entire_schedule(interaction.guild.id)
+        await interaction.response.send_message(
+            "Scrim times and premier windows reset to defaults for this server.",
+            ephemeral=True,
+        )
+
     def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
         configured = self.config_store.get_announcement_channel(guild.id)
         if configured:
             return configured
-        if ANNOUNCEMENT_CHANNEL_ID is not None:
+        if ANNOUNCEMENT_CHANNEL_ID:
             return ANNOUNCEMENT_CHANNEL_ID
         return None
 
     def _resolve_ping_mention(self, guild: discord.Guild) -> Optional[str]:
-        configured_role_id = (
-            self.config_store.get_ping_role(guild.id)
-            or self.config_store.get_available_role(guild.id)
-            or AVAILABLE_ROLE_ID
-        )
+        configured_role_id = self.config_store.get_ping_role(guild.id) or AVAILABLE_ROLE_ID
         if not configured_role_id:
             return None
         role = guild.get_role(configured_role_id)
@@ -372,6 +457,10 @@ class ScheduleCog(commands.Cog):
             return role.mention
         return None
 
+
+# ---------------------------------------------------------
+# Config Commands
+# ---------------------------------------------------------
 
 class ConfigCog(commands.Cog):
     def __init__(self, bot: commands.Bot, config_store: GuildConfigStore) -> None:
@@ -392,27 +481,15 @@ class ConfigCog(commands.Cog):
             f"Announcement channel set to {channel.mention}", ephemeral=True
         )
 
-    @config.command(name="pingrole", description="Set the role to ping when posting schedules")
-    @app_commands.describe(role="Role to mention for availability/scrim updates")
+    @config.command(name="pingrole", description="Set the role to ping / assign for availability")
+    @app_commands.describe(role="Role to mention and grant to available players")
     async def config_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
         self.config_store.set_ping_role(interaction.guild.id, role.id)
-        await interaction.response.send_message(f"Ping role set to {role.mention}", ephemeral=True)
-
-    @config.command(
-        name="availablerole",
-        description="Override the 'available today' role for this server (otherwise uses env AVAILABLE_ROLE_ID)",
-    )
-    @app_commands.describe(role="Role to give to players who are available today")
-    async def config_available_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
-        if not interaction.guild:
-            await interaction.response.send_message("Run this in a server.", ephemeral=True)
-            return
-        self.config_store.set_available_role(interaction.guild.id, role.id)
-        await interaction.response.send_message(f"Available role set to {role.mention}", ephemeral=True)
+        await interaction.response.send_message(f"Ping / availability role set to {role.mention}", ephemeral=True)
 
     @config.command(
         name="teamroles",
@@ -450,88 +527,195 @@ class ConfigCog(commands.Cog):
             "Saved team roles: " + ", ".join(parts), ephemeral=True
         )
 
+    # ---- Scrim time config commands ----
+
     @config.command(
-        name="premierwindow",
-        description="Set the Premier time window label for a specific day (e.g., '7-8 PM ET')",
+        name="scrim_set",
+        description="Set scrim start time for a given day (HH:MM ET, or 'off')",
     )
-    @app_commands.describe(day="Day of week (e.g. wednesday)", window="Display text for the premier window")
-    async def config_premier_window(
-        self,
-        interaction: discord.Interaction,
-        day: str,
-        window: str,
-    ) -> None:
+    @app_commands.describe(day="Day of week (e.g. wed, friday)", time="Time in HH:MM, or 'off'")
+    async def config_scrim_set(self, interaction: discord.Interaction, day: str, time: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        normalized_day = normalize_day(day)
-        if not normalized_day:
+        normalized = normalize_day(day)
+        if not normalized:
+            await interaction.response.send_message("Invalid day. Try 'wed', 'friday', etc.", ephemeral=True)
+            return
+
+        time = time.strip().lower()
+        if time in {"off", "none"}:
+            self.config_store.set_scrim_time(interaction.guild.id, normalized, None)
             await interaction.response.send_message(
-                "Please provide a valid day (e.g. 'wednesday').", ephemeral=True
+                f"Scrims turned **off** for {normalized.title()}.", ephemeral=True
             )
             return
 
-        self.config_store.set_premier_window(interaction.guild.id, normalized_day, window)
+        parsed = parse_time_hhmm(time)
+        if not parsed:
+            await interaction.response.send_message(
+                "Invalid time. Use 24h format like `19:00` for 7 PM.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_scrim_time(interaction.guild.id, normalized, f"{parsed[0]:02d}:{parsed[1]:02d}")
         await interaction.response.send_message(
-            f"Premier window for **{normalized_day.title()}** set to `{window}`.", ephemeral=True
+            f"Scrim time for {normalized.title()} set to `{parsed[0]:02d}:{parsed[1]:02d}` ET.",
+            ephemeral=True,
         )
 
     @config.command(
-        name="scrimtime",
-        description="Set scrim/tryout start time (24h HH:MM). Use day='all' to set default for all days.",
+        name="scrim_reset_day",
+        description="Turn off scrims for a specific day",
     )
-    @app_commands.describe(day="Day of week (e.g. friday) or 'all'", time="Time in 24h format, e.g. 19:00 for 7 PM")
-    async def config_scrim_time(
-        self,
-        interaction: discord.Interaction,
-        day: str,
-        time: str,
-    ) -> None:
+    @app_commands.describe(day="Day of week (e.g. monday)")
+    async def config_scrim_reset_day(self, interaction: discord.Interaction, day: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        try:
-            hour_str, minute_str = time.split(":")
-            hour = int(hour_str)
-            minute = int(minute_str)
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message(
-                "Use time in 24h format like `19:00` for 7 PM.", ephemeral=True
-            )
+        normalized = normalize_day(day)
+        if not normalized:
+            await interaction.response.send_message("Invalid day.", ephemeral=True)
             return
 
-        if day.lower() == "all":
-            # set default and per-day fallbacks
-            self.config_store.set_default_scrim_time(interaction.guild.id, time)
-            for d in WEEK_DAYS:
-                self.config_store.set_scrim_time(interaction.guild.id, d, time)
-            await interaction.response.send_message(
-                f"Scrim time set to {time} for all days.", ephemeral=True
-            )
-            return
-
-        normalized_day = normalize_day(day)
-        if not normalized_day:
-            await interaction.response.send_message(
-                "Please provide a valid day (or 'all').", ephemeral=True
-            )
-            return
-
-        self.config_store.set_scrim_time(interaction.guild.id, normalized_day, time)
+        self.config_store.set_scrim_time(interaction.guild.id, normalized, None)
         await interaction.response.send_message(
-            f"Scrim time for **{normalized_day.title()}** set to {time}.", ephemeral=True
+            f"Scrims turned **off** for {normalized.title()}.", ephemeral=True
         )
 
+    @config.command(
+        name="scrim_reset_all",
+        description="Reset scrim times back to default schedule (Wed–Sun active)",
+    )
+    async def config_scrim_reset_all(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
 
-class AutoResetter(commands.Cog):
-    """Handles weekly availability reset, daily 'available' role sync,
-    and 30-minute scrim pings when there are enough players.
-    """
+        self.config_store.reset_scrim_times(interaction.guild.id)
+        await interaction.response.send_message(
+            "Scrim times reset to **default** for this server.", ephemeral=True
+        )
 
+    @config.command(
+        name="scrim_check",
+        description="List scrim times for each day",
+    )
+    async def config_scrim_check(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        lines: List[str] = ["**Scrim Times (HH:MM ET)**", ""]
+        for d in WEEK_DAYS:
+            t = self.config_store.get_scrim_time(guild_id, d)
+            lines.append(f"- {d.title()}: `{t}`" if t else f"- {d.title()}: Off")
+
+        embed = format_embed("Scrim Times", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ---- Premier window config commands ----
+
+    @config.command(
+        name="premier_set",
+        description="Set premier window for a given day (e.g. 19:00-20:00, or 'off')",
+    )
+    @app_commands.describe(day="Day of week (e.g. wed)", window="Time window like 19:00-20:00, or 'off'")
+    async def config_premier_set(self, interaction: discord.Interaction, day: str, window: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        normalized = normalize_day(day)
+        if not normalized:
+            await interaction.response.send_message("Invalid day.", ephemeral=True)
+            return
+
+        window = window.strip().lower()
+        if window in {"off", "none"}:
+            self.config_store.set_premier_window(interaction.guild.id, normalized, None)
+            await interaction.response.send_message(
+                f"Premier turned **off** for {normalized.title()}.", ephemeral=True
+            )
+            return
+
+        # Minimal validation: expect "HH:MM-HH:MM"
+        parts = window.split("-")
+        if len(parts) != 2 or not (parse_time_hhmm(parts[0]) and parse_time_hhmm(parts[1])):
+            await interaction.response.send_message(
+                "Invalid window. Use `19:00-20:00` format or 'off'.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_premier_window(interaction.guild.id, normalized, window)
+        await interaction.response.send_message(
+            f"Premier window for {normalized.title()} set to `{window}`.", ephemeral=True
+        )
+
+    @config.command(
+        name="premier_reset_day",
+        description="Turn off premier for a specific day",
+    )
+    @app_commands.describe(day="Day of week (e.g. sunday)")
+    async def config_premier_reset_day(self, interaction: discord.Interaction, day: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        normalized = normalize_day(day)
+        if not normalized:
+            await interaction.response.send_message("Invalid day.", ephemeral=True)
+            return
+
+        self.config_store.set_premier_window(interaction.guild.id, normalized, None)
+        await interaction.response.send_message(
+            f"Premier turned **off** for {normalized.title()}.", ephemeral=True
+        )
+
+    @config.command(
+        name="premier_reset_all",
+        description="Reset premier windows back to default schedule (Wed–Sun active)",
+    )
+    async def config_premier_reset_all(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.config_store.reset_premier_windows(interaction.guild.id)
+        await interaction.response.send_message(
+            "Premier windows reset to **default** for this server.", ephemeral=True
+        )
+
+    @config.command(
+        name="premier_check",
+        description="List premier windows for each day",
+    )
+    async def config_premier_check(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        lines: List[str] = ["**Premier Windows**", ""]
+        for d in WEEK_DAYS:
+            w = self.config_store.get_premier_window(guild_id, d)
+            lines.append(f"- {d.title()}: `{w}`" if w else f"- {d.title()}: Off")
+
+        embed = format_embed("Premier Windows", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------
+# Background Tasks:
+# - Weekly auto-reset of availability
+# - Daily role sync for "available" role
+# - 30-minute pre-scrim pings
+# ---------------------------------------------------------
+
+class BackgroundTasksCog(commands.Cog):
     def __init__(
         self,
         bot: commands.Bot,
@@ -541,91 +725,52 @@ class AutoResetter(commands.Cog):
         self.bot = bot
         self.availability_store = availability_store
         self.config_store = config_store
-        self._target_weekday = self._resolve_reset_weekday()
+
+        # Determine which weekday to reset on (0=Monday, 6=Sunday)
+        try:
+            self._reset_weekday_index = WEEK_DAYS.index(AUTO_RESET_DAY)
+        except ValueError:
+            logging.warning("Invalid AUTO_RESET_DAY %s, defaulting to monday", AUTO_RESET_DAY)
+            self._reset_weekday_index = 0
+
         self.last_reset_date: Optional[date] = None
-        self.scrim_ping_history: Dict[Tuple[int, str, date], bool] = {}  # (guild_id, day, date) -> True
+        self._last_scrim_ping: Dict[Tuple[int, str], date] = {}
 
     async def cog_load(self) -> None:
-        # Start background tasks once the cog is loaded
         if not self.auto_reset_task.is_running():
             self.auto_reset_task.start()
-        if not self.daily_role_task.is_running():
-            self.daily_role_task.start()
+        if not self.role_sync_task.is_running():
+            self.role_sync_task.start()
         if not self.scrim_ping_task.is_running():
             self.scrim_ping_task.start()
 
     def cog_unload(self) -> None:
-        # Stop loops cleanly when cog is unloaded
-        for loop in (self.auto_reset_task, self.daily_role_task, self.scrim_ping_task):
-            if loop.is_running():
-                loop.cancel()
+        for task in (self.auto_reset_task, self.role_sync_task, self.scrim_ping_task):
+            if task.is_running():
+                task.cancel()
 
-    # ---------- Helpers ----------
-
-    def _resolve_reset_weekday(self) -> int:
-        try:
-            return WEEK_DAYS.index(AUTO_RESET_DAY)
-        except ValueError:
-            logging.warning("Invalid AUTO_RESET_DAY %s, defaulting to Monday", AUTO_RESET_DAY)
-            return 0
+    # ---- Helpers ----
 
     def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
         configured = self.config_store.get_announcement_channel(guild.id)
         if configured:
             return configured
-        if ANNOUNCEMENT_CHANNEL_ID is not None:
+        if ANNOUNCEMENT_CHANNEL_ID:
             return ANNOUNCEMENT_CHANNEL_ID
         return None
 
-    def _resolve_available_role_id(self, guild: discord.Guild) -> Optional[int]:
-        # Guild-specific override, then env AVAILABLE_ROLE_ID.
-        cfg = self.config_store.get_available_role(guild.id)
-        return cfg or AVAILABLE_ROLE_ID
-
-    def _resolve_ping_role_id(self, guild: discord.Guild) -> Optional[int]:
+    def _resolve_availability_role_id(self, guild: discord.Guild) -> Optional[int]:
         configured = self.config_store.get_ping_role(guild.id)
         if configured:
             return configured
-        return self._resolve_available_role_id(guild)
+        return AVAILABLE_ROLE_ID
 
-    def _resolve_scrim_time(self, guild: discord.Guild, weekday_index: int) -> Tuple[str, int, int]:
-        """Return (label, hour, minute) for scrim start on a given weekday."""
-        day_name = WEEK_DAYS[weekday_index]
-        time_str = self.config_store.get_scrim_time(guild.id, day_name)
-        if not time_str:
-            # fall back to default scrim time or constant
-            default_str = self.config_store.get_default_scrim_time(guild.id)
-            if default_str:
-                time_str = default_str
-            else:
-                # "19:00" -> 7 PM by default
-                time_str = "19:00"
-
-        try:
-            hour_str, minute_str = time_str.split(":")
-            hour = int(hour_str)
-            minute = int(minute_str)
-        except ValueError:
-            logging.warning("Invalid scrim_time '%s' for guild %s", time_str, guild.id)
-            hour, minute = 19, 0
-            time_str = "19:00"
-
-        label = f"{hour:02d}:{minute:02d} ET"
-        return label, hour, minute
-
-    # ---------- Weekly auto-reset ----------
+    # ---- Auto-reset availability weekly ----
 
     @tasks.loop(minutes=30)
     async def auto_reset_task(self) -> None:
-        await self._maybe_reset()
-
-    @auto_reset_task.before_loop
-    async def before_auto_reset_task(self) -> None:
-        await self.bot.wait_until_ready()
-
-    async def _maybe_reset(self) -> None:
         now = datetime.now()
-        if now.weekday() != self._target_weekday or now.hour < AUTO_RESET_HOUR:
+        if now.weekday() != self._reset_weekday_index or now.hour < AUTO_RESET_HOUR:
             return
         if self.last_reset_date == now.date():
             return
@@ -634,186 +779,172 @@ class AutoResetter(commands.Cog):
         self.last_reset_date = now.date()
         logging.info("Auto-reset availability for new week; cleared %d users", cleared)
 
-        # Also clear available roles from everyone, since week reset.
-        for guild in self.bot.guilds:
-            role_id = self._resolve_available_role_id(guild)
-            if not role_id:
-                continue
-            role = guild.get_role(role_id)
-            if not role:
-                continue
-            for member in list(role.members):
-                try:
-                    await member.remove_roles(role, reason="Weekly availability reset")
-                except discord.HTTPException:
-                    logging.warning("Failed to remove available role from %s during reset", member)
-
-        await self._announce_reset(cleared)
-
-    async def _announce_reset(self, cleared: int) -> None:
-        if cleared == 0:
-            return
+        # Announce reset in each guild that has an announcement channel
         for guild in self.bot.guilds:
             channel_id = self._resolve_announcement_channel_id(guild)
             if not channel_id:
                 continue
             channel = guild.get_channel(channel_id)
-            if not channel:
+            if not isinstance(channel, discord.TextChannel):
                 continue
             try:
                 await channel.send(
-                    f"Weekly reset done: cleared availability for {cleared} players."
-                    " Set your days with /availability set or the signup panel!"
+                    f"Weekly reset done: cleared availability for {cleared} players. "
+                    "Set your new days with `/availability set` or the signup panel!"
                 )
             except discord.HTTPException:
-                logging.warning("Failed to announce reset in guild %s", guild.name)
+                logging.warning("Failed to announce weekly reset in guild %s", guild.name)
 
-    # ---------- Daily 'available' role sync ----------
-
-    @tasks.loop(minutes=10)
-    async def daily_role_task(self) -> None:
-        await self._sync_available_role_for_today()
-
-    @daily_role_task.before_loop
-    async def before_daily_role_task(self) -> None:
+    @auto_reset_task.before_loop
+    async def before_auto_reset_task(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _sync_available_role_for_today(self) -> None:
-        today_index = datetime.now().weekday()
-        today_name = WEEK_DAYS[today_index]
+    # ---- Daily role sync for "available" role ----
 
-        users_today = {
-            user["id"] for user in self.availability_store.users_for_day(today_name)
-        }
+    @tasks.loop(minutes=30)
+    async def role_sync_task(self) -> None:
+        now = datetime.now()
+        today = WEEK_DAYS[now.weekday()]
+        users_today = self.availability_store.users_for_day(today)
+        available_ids: Set[int] = {int(info["id"]) for info in users_today}
 
         for guild in self.bot.guilds:
-            role_id = self._resolve_available_role_id(guild)
+            role_id = self._resolve_availability_role_id(guild)
             if not role_id:
                 continue
             role = guild.get_role(role_id)
             if not role:
                 continue
 
-            # Add role to users who should have it
-            for user_id in users_today:
-                member = guild.get_member(user_id)
-                if member and role not in member.roles:
+            # Remove from members who should not have it
+            for member in guild.members:
+                has_role = role in member.roles
+                should_have = member.id in available_ids
+                if has_role and not should_have:
                     try:
-                        await member.add_roles(role, reason=f"Available on {today_name}")
+                        await member.remove_roles(role, reason="Not available today")
                     except discord.HTTPException:
-                        logging.warning("Failed to add available role to %s", member)
+                        logging.warning("Failed to remove availability role from %s", member)
 
-            # Remove role from members who are not available today
-            for member in list(role.members):
-                if member.id not in users_today:
+            # Grant to members who should have it
+            for uid in available_ids:
+                member = guild.get_member(uid)
+                if not member:
+                    continue
+                if role not in member.roles:
                     try:
-                        await member.remove_roles(role, reason="Not marked available today")
+                        await member.add_roles(role, reason="Available today")
                     except discord.HTTPException:
-                        logging.warning("Failed to remove available role from %s", member)
+                        logging.warning("Failed to add availability role to %s", member)
 
-    # ---------- 30-minute scrim ping ----------
+    @role_sync_task.before_loop
+    async def before_role_sync_task(self) -> None:
+        await self.bot.wait_until_ready()
 
-    @tasks.loop(minutes=5)
+    # ---- Pre-scrim pings (30 minutes before scrim start) ----
+
+    @tasks.loop(minutes=1)
     async def scrim_ping_task(self) -> None:
-        await self._maybe_ping_scrim()
+        now = datetime.now()
+        today = WEEK_DAYS[now.weekday()]
+        minutes_now = now.hour * 60 + now.minute
+
+        for guild in self.bot.guilds:
+            scrim_time = self.config_store.get_scrim_time(guild.id, today)
+            if not scrim_time:
+                continue
+
+            parsed = parse_time_hhmm(scrim_time)
+            if not parsed:
+                continue
+
+            scrim_minutes = parsed[0] * 60 + parsed[1]
+            pre_minutes = scrim_minutes - 30
+            if pre_minutes < 0:
+                continue
+
+            if minutes_now != pre_minutes:
+                continue
+
+            key = (guild.id, today)
+            if self._last_scrim_ping.get(key) == now.date():
+                continue  # already pinged today
+
+            # Check if there are enough players
+            users_today = self.availability_store.users_for_day(today)
+            if len(users_today) < 10:
+                continue
+
+            channel_id = self._resolve_announcement_channel_id(guild)
+            if not channel_id:
+                continue
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            role_id = self._resolve_availability_role_id(guild)
+            mention = ""
+            if role_id:
+                role = guild.get_role(role_id)
+                if role:
+                    mention = role.mention
+
+            try:
+                await channel.send(
+                    f"{mention} Scrims start in **30 minutes** at `{scrim_time}` ET! "
+                    f"We have **{len(users_today)}** players marked available."
+                )
+                self._last_scrim_ping[key] = now.date()
+            except discord.HTTPException:
+                logging.warning("Failed to send scrim ping in guild %s", guild.name)
 
     @scrim_ping_task.before_loop
     async def before_scrim_ping_task(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _maybe_ping_scrim(self) -> None:
-        now = datetime.now()
-        weekday_index = now.weekday()
-        today_name = WEEK_DAYS[weekday_index]
-        users_today = self.availability_store.users_for_day(today_name)
 
-        if len(users_today) < 10:
-            # Not enough players, no ping.
-            return
+# ---------------------------------------------------------
+# Bot setup
+# ---------------------------------------------------------
 
-        for guild in self.bot.guilds:
-            channel_id = self._resolve_announcement_channel_id(guild)
-            if not channel_id:
-                continue
-            channel = guild.get_channel(channel_id)
-            if not channel:
-                continue
+def build_bot() -> commands.Bot:
+    intents = discord.Intents.default()
+    intents.members = True
 
-            label, hour, minute = self._resolve_scrim_time(guild, weekday_index)
-            target_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            diff_seconds = (target_dt - now).total_seconds()
+    bot = commands.Bot(command_prefix="!", intents=intents)
 
-            # We want "about 30 minutes before"
-            if not (0 <= diff_seconds <= 30 * 60):
-                continue
+    availability_store = AvailabilityStore()
+    config_store = GuildConfigStore()
 
-            key = (guild.id, today_name, now.date())
-            if self.scrim_ping_history.get(key):
-                # Already pinged today for this guild/day.
-                continue
+    # Attach stores so other extensions (if any) can access them
+    bot.availability_store = availability_store  # type: ignore[attr-defined]
+    bot.config_store = config_store  # type: ignore[attr-defined]
 
-            # Resolve ping role (ping role or available role)
-            role_id = self._resolve_ping_role_id(guild)
-            mention = ""
-            if role_id:
-                role = guild.get_role(role_id)
-                if role:
-                    mention = role.mention + " "
+    bot.add_cog(AvailabilityCog(bot, availability_store, config_store))
+    bot.add_cog(ScheduleCog(bot, availability_store, config_store))
+    bot.add_cog(ConfigCog(bot, config_store))
+    bot.add_cog(BackgroundTasksCog(bot, availability_store, config_store))
 
-            names = ", ".join(str(u["display_name"]) for u in users_today)
-            message = (
-                f"{mention}Scrim in ~30 minutes at {label}! "
-                f"We have {len(users_today)} players signed up for {today_name.title()}: {names}"
-            )
-
-            try:
-                await channel.send(message)
-                self.scrim_ping_history[key] = True
-            except discord.HTTPException:
-                logging.warning("Failed to send scrim ping in guild %s", guild.name)
-
-
-class ValorantBot(commands.Bot):
-    def __init__(self) -> None:
-        intents = discord.Intents.default()
-        intents.members = True
-        super().__init__(command_prefix="!", intents=intents)
-
-        self.availability_store = AvailabilityStore()
-        self.config_store = GuildConfigStore()
-
-    async def setup_hook(self) -> None:  # type: ignore[override]
-        await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
-        await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
-        await self.add_cog(ConfigCog(self, self.config_store))
-        await self.add_cog(AutoResetter(self, self.availability_store, self.config_store))
-
+    @bot.event
+    async def on_ready() -> None:
+        assert bot.user is not None
+        logging.info("Logged in as %s", bot.user)
         try:
-            synced = await self.tree.sync()
+            synced = await bot.tree.sync()
             logging.info("Synced %d app commands", len(synced))
         except discord.HTTPException as exc:
             logging.error("Failed to sync commands: %s", exc)
 
-    async def on_ready(self) -> None:  # type: ignore[override]
-        assert self.user is not None
-        logging.info("Logged in as %s", self.user)
+    return bot
 
 
-async def create_bot() -> commands.Bot:
-    return ValorantBot()
-
-
-async def main() -> None:
-    token = os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
+def main() -> None:
+    if not TOKEN:
         raise RuntimeError("DISCORD_BOT_TOKEN is required")
 
-    bot = await create_bot()
-    try:
-        await bot.start(token)
-    finally:
-        await bot.close()
+    bot = build_bot()
+    bot.run(TOKEN)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
