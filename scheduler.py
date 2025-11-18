@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional
 
-from storage import AvailabilityStore
+from storage import AvailabilityStore, GuildConfigStore
+from time_utils import format_time_with_zone, parse_time_string
 
 WEEK_DAYS = [
     "monday",
@@ -25,6 +27,7 @@ PREMIER_WINDOWS = {
 }
 
 DEFAULT_SCRIM_TIME = os.getenv("DEFAULT_SCRIM_START_TIME", "7:00 PM")
+DEFAULT_TIMEZONE = os.getenv("SCRIM_TIMEZONE", "America/New_York")
 
 
 @dataclass
@@ -35,6 +38,7 @@ class DaySummary:
     premier_team: Optional[str]
     premier_window: Optional[str]
     scrim_ready: bool
+    scrim_time_display: str
     available_names: List[str]
 
     def to_line(self) -> str:
@@ -44,9 +48,11 @@ class DaySummary:
         elif self.premier_window:
             premier_status = f"Premier needs 5 from Team A or B @ {self.premier_window}"
 
-        scrim_status = "Scrim ready" if self.scrim_ready else "Scrim needs {missing} more"
-        if not self.scrim_ready:
-            scrim_status = f"Scrim needs {max(0, 10 - self.total_available)} more"
+        scrim_status = (
+            f"Scrim ready @ {self.scrim_time_display}"
+            if self.scrim_ready
+            else f"Scrim @ {self.scrim_time_display} needs {max(0, 10 - self.total_available)} more"
+        )
 
         team_lines = ", ".join(
             f"Team {team}: {count}" for team, count in sorted(self.team_counts.items())
@@ -61,11 +67,17 @@ class DaySummary:
 
 
 class ScheduleBuilder:
-    def __init__(self, availability_store: AvailabilityStore) -> None:
+    def __init__(
+        self, availability_store: AvailabilityStore, config_store: GuildConfigStore
+    ) -> None:
         self.availability_store = availability_store
+        self.config_store = config_store
 
-    def build_week(self) -> List[DaySummary]:
+    def build_week(self, guild_id: Optional[int] = None) -> List[DaySummary]:
         summaries: List[DaySummary] = []
+        timezone = self.config_store.resolve_timezone(guild_id, DEFAULT_TIMEZONE)
+        today = date.today()
+
         for day in WEEK_DAYS:
             users = self.availability_store.users_for_day(day)
             team_counts: Dict[str, int] = {"A": 0, "B": 0}
@@ -76,9 +88,18 @@ class ScheduleBuilder:
                     team_counts[team] += 1
                 names.append(str(info.get("display_name")))
 
-            premier_window = PREMIER_WINDOWS.get(day)
+            premier_window = self.config_store.get_premier_window(guild_id, day)
+            if not premier_window:
+                premier_window = PREMIER_WINDOWS.get(day)
+
             premier_team = self._select_premier_team(team_counts) if premier_window else None
             scrim_ready = len(users) >= 10
+
+            scrim_time_str = self.config_store.get_scrim_time(guild_id, day) or DEFAULT_SCRIM_TIME
+            parsed_time = parse_time_string(scrim_time_str) or parse_time_string(DEFAULT_SCRIM_TIME)
+            scrim_time_display = scrim_time_str
+            if parsed_time:
+                scrim_time_display = format_time_with_zone(today, parsed_time, timezone)
 
             summaries.append(
                 DaySummary(
@@ -88,6 +109,7 @@ class ScheduleBuilder:
                     premier_team=premier_team,
                     premier_window=premier_window,
                     scrim_ready=scrim_ready,
+                    scrim_time_display=scrim_time_display,
                     available_names=names,
                 )
             )
@@ -101,10 +123,10 @@ class ScheduleBuilder:
         return max(qualified, key=qualified.get)
 
     @staticmethod
-    def format_schedule(summaries: List[DaySummary]) -> str:
+    def format_schedule(summaries: List[DaySummary], timezone_name: str) -> str:
         header = (
-            "Valorant Availability — Premier Wed-Sun (7-8 PM ET, Fri/Sat 8-9 PM ET) | "
-            f"Scrims target configured times (default {DEFAULT_SCRIM_TIME}) if 10+ players"
+            "Valorant Availability — Times shown in "
+            f"{timezone_name} | Scrims target configured per-day start times when 10+ players"
         )
         lines = [header, ""]
         for summary in summaries:

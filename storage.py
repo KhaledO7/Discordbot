@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from zoneinfo import ZoneInfo
+
 
 class AvailabilityStore:
     """Persist user availability for the week.
@@ -92,7 +94,7 @@ class GuildConfigStore:
     def __init__(self, path: Path | str = Path("data/guild_config.json")) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._data: Dict[str, Dict[str, int]] = {}
+        self._data: Dict[str, Dict[str, object]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -112,6 +114,10 @@ class GuildConfigStore:
         self._data.setdefault(str(guild_id), {})["ping_role_id"] = role_id
         self._persist()
 
+    def set_available_role(self, guild_id: int, role_id: int) -> None:
+        self._data.setdefault(str(guild_id), {})["available_role_id"] = role_id
+        self._persist()
+
     def set_team_roles(
         self, guild_id: int, team_a_role_id: int | None, team_b_role_id: int | None
     ) -> None:
@@ -128,22 +134,47 @@ class GuildConfigStore:
         times[day] = time_str
         self._persist()
 
-    def get_scrim_time(self, guild_id: int, day: str) -> Optional[str]:
-        return self._data.get(str(guild_id), {}).get("scrim_times", {}).get(day)
+    def set_premier_window(self, guild_id: int, day: str, window: str) -> None:
+        guild_data = self._data.setdefault(str(guild_id), {})
+        windows = guild_data.setdefault("premier_windows", {})
+        windows[day] = window
+        self._persist()
 
     def set_scrim_timezone(self, guild_id: int, timezone: str) -> None:
         guild_data = self._data.setdefault(str(guild_id), {})
         guild_data["scrim_timezone"] = timezone
         self._persist()
 
+    def get_scrim_time(self, guild_id: int, day: str) -> Optional[str]:
+        return self._data.get(str(guild_id), {}).get("scrim_times", {}).get(day)
+
+    def get_premier_window(self, guild_id: int, day: str) -> Optional[str]:
+        return self._data.get(str(guild_id), {}).get("premier_windows", {}).get(day)
+
     def get_scrim_timezone(self, guild_id: int) -> Optional[str]:
         return self._data.get(str(guild_id), {}).get("scrim_timezone")
+
+    def resolve_timezone(self, guild_id: Optional[int], fallback: str = "UTC") -> ZoneInfo:
+        if guild_id is not None:
+            timezone_name = self.get_scrim_timezone(guild_id)
+            if timezone_name:
+                try:
+                    return ZoneInfo(timezone_name)
+                except Exception:
+                    pass
+        try:
+            return ZoneInfo(fallback)
+        except Exception:
+            return ZoneInfo("UTC")
 
     def get_announcement_channel(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("announcement_channel_id")
 
     def get_ping_role(self, guild_id: int) -> Optional[int]:
         return self._data.get(str(guild_id), {}).get("ping_role_id")
+
+    def get_available_role(self, guild_id: int) -> Optional[int]:
+        return self._data.get(str(guild_id), {}).get("available_role_id")
 
     def get_team_roles(self, guild_id: int) -> Dict[str, Optional[int]]:
         data = self._data.get(str(guild_id), {})

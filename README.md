@@ -7,14 +7,15 @@ A lightweight Discord bot for managing Valorant Premier nights and 5v5 scrim ava
 - Automatic weekly summary showing Premier readiness (needs 5 from a single team) and scrim readiness (needs 10 total).
 - Posts the schedule into an announcement channel and optionally pings a configured role.
 - Automatic scrim reminders that fire 30 minutes before the configured start time when 10+ players are available.
+- Optional daily role sync that grants an "available" role to everyone signed up for the current day and removes it after.
 - Quick signup select menu with a built-in clear button so players can update availability without typing commands.
 - Optional weekly auto-reset so availability clears on a chosen day/hour (default: Mondays at 8 AM server time).
 - Simple JSON persistence—no external database required.
 
 ## Premier & Scrim Rules
-- Premier runs **Wednesday–Sunday**.
-  - **Wednesday/Thursday/Sunday:** 7–8 PM ET
-  - **Friday/Saturday:** 8–9 PM ET
+- Premier defaults to **Wednesday–Sunday** with the windows listed below, but you can override each day with `/config premierwindow`.
+  - **Wednesday/Thursday/Sunday:** 7–8 PM ET (default)
+  - **Friday/Saturday:** 8–9 PM ET (default)
 - Scrims target **the configured start time** (default 7 PM in your configured timezone) on any day where 10+ players are available.
 
 ## Quick start (Version 2)
@@ -77,8 +78,10 @@ Once the bot is online, run these slash commands in your server:
 - `/schedule post` — send the schedule to the configured announcement channel and ping the availability role if set.
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
 - `/config pingrole role:<@role>` — set the role to mention when posting schedules.
+- `/config availablerole role:<@role>` — set the role to grant players who are marked available today.
 - `/config teamroles [team_a:<@role>] [team_b:<@role>]` — set Team A/B role IDs for accurate detection.
 - `/config scrimtime day:<weekday> time:<19:00|7:00 PM> [timezone:<America/New_York>]` — set the scrim start time and optional timezone for a specific day.
+- `/config premierwindow day:<weekday> window:<7:00-8:00 PM ET>` — override the Premier window text for a given day.
 
 ## Data Storage
 Availability and guild configuration are stored as JSON under `data/`. The directory is created automatically on first run; the files can be safely deleted to reset state.
