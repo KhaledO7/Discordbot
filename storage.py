@@ -79,7 +79,6 @@ class AvailabilityStore:
 
         Returns the number of users that were cleared.
         """
-
         cleared = len(self._data.get("users", {}))
         self._data["users"] = {}
         self._persist()
@@ -92,7 +91,7 @@ class GuildConfigStore:
     def __init__(self, path: Path | str = Path("data/guild_config.json")) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._data: Dict[str, Dict[str, int]] = {}
+        self._data: Dict[str, Dict[str, object]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -103,6 +102,8 @@ class GuildConfigStore:
 
     def _persist(self) -> None:
         self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+
+    # ---------- Basic config ----------
 
     def set_announcement_channel(self, guild_id: int, channel_id: int) -> None:
         self._data.setdefault(str(guild_id), {})["announcement_channel_id"] = channel_id
@@ -122,33 +123,38 @@ class GuildConfigStore:
             guild_data["team_b_role_id"] = team_b_role_id
         self._persist()
 
-    def set_scrim_time(self, guild_id: int, day: str, time_str: str) -> None:
-        guild_data = self._data.setdefault(str(guild_id), {})
-        times = guild_data.setdefault("scrim_times", {})
-        times[day] = time_str
-        self._persist()
-
-    def get_scrim_time(self, guild_id: int, day: str) -> Optional[str]:
-        return self._data.get(str(guild_id), {}).get("scrim_times", {}).get(day)
-
-    def set_scrim_timezone(self, guild_id: int, timezone: str) -> None:
-        guild_data = self._data.setdefault(str(guild_id), {})
-        guild_data["scrim_timezone"] = timezone
-        self._persist()
-
-    def get_scrim_timezone(self, guild_id: int) -> Optional[str]:
-        return self._data.get(str(guild_id), {}).get("scrim_timezone")
-
     def get_announcement_channel(self, guild_id: int) -> Optional[int]:
-        return self._data.get(str(guild_id), {}).get("announcement_channel_id")
+        return self._data.get(str(guild_id), {}).get("announcement_channel_id")  # type: ignore[return-value]
 
     def get_ping_role(self, guild_id: int) -> Optional[int]:
-        return self._data.get(str(guild_id), {}).get("ping_role_id")
+        return self._data.get(str(guild_id), {}).get("ping_role_id")  # type: ignore[return-value]
 
     def get_team_roles(self, guild_id: int) -> Dict[str, Optional[int]]:
         data = self._data.get(str(guild_id), {})
         return {
-            "A": data.get("team_a_role_id"),
-            "B": data.get("team_b_role_id"),
+            "A": data.get("team_a_role_id"),  # type: ignore[return-value]
+            "B": data.get("team_b_role_id"),  # type: ignore[return-value]
         }
 
+    # ---------- Premier windows (display strings) ----------
+
+    def set_premier_window(self, guild_id: int, day: str, window: str) -> None:
+        guild = self._data.setdefault(str(guild_id), {})
+        windows = guild.setdefault("premier_windows", {})
+        windows[day.lower()] = window
+        self._persist()
+
+    def get_premier_windows(self, guild_id: int) -> Dict[str, str]:
+        guild = self._data.get(str(guild_id), {})
+        return guild.get("premier_windows", {})  # type: ignore[return-value]
+
+    # ---------- Scrim time (HH:MM 24h string) ----------
+
+    def set_scrim_time(self, guild_id: int, time_str: str) -> None:
+        guild = self._data.setdefault(str(guild_id), {})
+        guild["scrim_time"] = time_str
+        self._persist()
+
+    def get_scrim_time(self, guild_id: int) -> Optional[str]:
+        guild = self._data.get(str(guild_id), {})
+        return guild.get("scrim_time")  # type: ignore[return-value]
