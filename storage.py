@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from zoneinfo import ZoneInfo
-
 
 class AvailabilityStore:
     """Persist user availability for the week.
@@ -88,7 +86,7 @@ class AvailabilityStore:
 
 
 class GuildConfigStore:
-    """Track guild-specific config such as announcement channel and ping role."""
+    """Track guild-specific config such as announcement channel, roles, and times."""
 
     def __init__(self, path: Path | str = Path("data/guild_config.json")) -> None:
         self.path = Path(path)
@@ -107,63 +105,98 @@ class GuildConfigStore:
 
     # ---------- Basic config ----------
 
+    def _guild(self, guild_id: int) -> Dict[str, object]:
+        return self._data.setdefault(str(guild_id), {})
+
     def set_announcement_channel(self, guild_id: int, channel_id: int) -> None:
-        self._data.setdefault(str(guild_id), {})["announcement_channel_id"] = channel_id
+        g = self._guild(guild_id)
+        g["announcement_channel_id"] = channel_id
         self._persist()
+
+    def get_announcement_channel(self, guild_id: int) -> Optional[int]:
+        g = self._data.get(str(guild_id), {})
+        value = g.get("announcement_channel_id")
+        return int(value) if isinstance(value, int) else None
 
     def set_ping_role(self, guild_id: int, role_id: int) -> None:
-        self._data.setdefault(str(guild_id), {})["ping_role_id"] = role_id
+        g = self._guild(guild_id)
+        g["ping_role_id"] = role_id
         self._persist()
 
+    def get_ping_role(self, guild_id: int) -> Optional[int]:
+        g = self._data.get(str(guild_id), {})
+        value = g.get("ping_role_id")
+        return int(value) if isinstance(value, int) else None
+
     def set_available_role(self, guild_id: int, role_id: int) -> None:
-        self._data.setdefault(str(guild_id), {})["available_role_id"] = role_id
+        g = self._guild(guild_id)
+        g["available_role_id"] = role_id
         self._persist()
+
+    def get_available_role(self, guild_id: int) -> Optional[int]:
+        g = self._data.get(str(guild_id), {})
+        value = g.get("available_role_id")
+        return int(value) if isinstance(value, int) else None
 
     def set_team_roles(
         self, guild_id: int, team_a_role_id: int | None, team_b_role_id: int | None
     ) -> None:
-        guild_data = self._data.setdefault(str(guild_id), {})
+        g = self._guild(guild_id)
         if team_a_role_id is not None:
-            guild_data["team_a_role_id"] = team_a_role_id
+            g["team_a_role_id"] = team_a_role_id
         if team_b_role_id is not None:
-            guild_data["team_b_role_id"] = team_b_role_id
+            g["team_b_role_id"] = team_b_role_id
         self._persist()
 
-    def get_announcement_channel(self, guild_id: int) -> Optional[int]:
-        return self._data.get(str(guild_id), {}).get("announcement_channel_id")  # type: ignore[return-value]
-
-    def get_ping_role(self, guild_id: int) -> Optional[int]:
-        return self._data.get(str(guild_id), {}).get("ping_role_id")  # type: ignore[return-value]
-
-    def get_available_role(self, guild_id: int) -> Optional[int]:
-        return self._data.get(str(guild_id), {}).get("available_role_id")
-
-    def get_team_roles(self, guild_id: int) -> Dict[str, Optional[int]]:
-        data = self._data.get(str(guild_id), {})
+    def get_team_roles(self, guild_id: Optional[int]) -> Dict[str, Optional[int]]:
+        if guild_id is None:
+            return {"A": None, "B": None}
+        g = self._data.get(str(guild_id), {})
+        a_val = g.get("team_a_role_id")
+        b_val = g.get("team_b_role_id")
         return {
-            "A": data.get("team_a_role_id"),  # type: ignore[return-value]
-            "B": data.get("team_b_role_id"),  # type: ignore[return-value]
+            "A": int(a_val) if isinstance(a_val, int) else None,
+            "B": int(b_val) if isinstance(b_val, int) else None,
         }
 
     # ---------- Premier windows (display strings) ----------
 
     def set_premier_window(self, guild_id: int, day: str, window: str) -> None:
-        guild = self._data.setdefault(str(guild_id), {})
-        windows = guild.setdefault("premier_windows", {})
+        g = self._guild(guild_id)
+        windows = g.setdefault("premier_windows", {})
         windows[day.lower()] = window
         self._persist()
 
     def get_premier_windows(self, guild_id: int) -> Dict[str, str]:
-        guild = self._data.get(str(guild_id), {})
-        return guild.get("premier_windows", {})  # type: ignore[return-value]
+        g = self._data.get(str(guild_id), {})
+        windows = g.get("premier_windows", {})
+        if isinstance(windows, dict):
+            # ensure keys are strings and values are strings
+            return {str(k).lower(): str(v) for k, v in windows.items()}
+        return {}
 
-    # ---------- Scrim time (HH:MM 24h string) ----------
+    # ---------- Scrim time (per-day HH:MM 24h string) ----------
 
-    def set_scrim_time(self, guild_id: int, time_str: str) -> None:
-        guild = self._data.setdefault(str(guild_id), {})
-        guild["scrim_time"] = time_str
+    def set_scrim_time(self, guild_id: int, day: str, time_str: str) -> None:
+        g = self._guild(guild_id)
+        times = g.setdefault("scrim_times", {})
+        times[day.lower()] = time_str
         self._persist()
 
-    def get_scrim_time(self, guild_id: int) -> Optional[str]:
-        guild = self._data.get(str(guild_id), {})
-        return guild.get("scrim_time")  # type: ignore[return-value]
+    def get_scrim_time(self, guild_id: int, day: str) -> Optional[str]:
+        g = self._data.get(str(guild_id), {})
+        times = g.get("scrim_times", {})
+        if isinstance(times, dict):
+            value = times.get(day.lower())
+            return str(value) if isinstance(value, str) else None
+        return None
+
+    def set_default_scrim_time(self, guild_id: int, time_str: str) -> None:
+        g = self._guild(guild_id)
+        g["default_scrim_time"] = time_str
+        self._persist()
+
+    def get_default_scrim_time(self, guild_id: int) -> Optional[str]:
+        g = self._data.get(str(guild_id), {})
+        value = g.get("default_scrim_time")
+        return str(value) if isinstance(value, str) else None
