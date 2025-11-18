@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import discord
 
 from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS
+
+
+def _safe_int_env(var_name: str) -> Optional[int]:
+    raw = os.getenv(var_name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+TEAM_A_ROLE_ID_ENV: Optional[int] = _safe_int_env("TEAM_A_ROLE_ID")
+TEAM_B_ROLE_ID_ENV: Optional[int] = _safe_int_env("TEAM_B_ROLE_ID")
 
 
 @dataclass
@@ -62,10 +77,10 @@ class ScheduleBuilder:
     def build_week(self, guild: discord.Guild) -> List[DaySummary]:
         summaries: List[DaySummary] = []
 
-        # Get configured team role IDs for this guild
+        # Get configured team role IDs for this guild, falling back to env if not set
         team_roles = self.config_store.get_team_roles(guild.id)
-        team_a_id = team_roles.get("A")
-        team_b_id = team_roles.get("B")
+        team_a_id = team_roles.get("A") or TEAM_A_ROLE_ID_ENV
+        team_b_id = team_roles.get("B") or TEAM_B_ROLE_ID_ENV
 
         for day in WEEK_DAYS:
             users = self.availability_store.users_for_day(day)
@@ -78,7 +93,7 @@ class ScheduleBuilder:
 
                 team: Optional[str] = None
 
-                # Prefer live Discord roles
+                # First preference: live Discord roles if we can see the member
                 if member is not None:
                     member_role_ids = {r.id for r in member.roles}
                     if team_a_id and team_a_id in member_role_ids:
@@ -86,7 +101,7 @@ class ScheduleBuilder:
                     elif team_b_id and team_b_id in member_role_ids:
                         team = "B"
                 else:
-                    # Fallback to stored team if member not visible (left server, etc.)
+                    # Fallback: stored team value, for members we can't see anymore
                     stored_team = (str(info.get("team") or "")).upper()
                     if stored_team in {"A", "B"}:
                         team = stored_team
