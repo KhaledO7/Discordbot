@@ -74,6 +74,17 @@ class AvailabilityStore:
     def all_users(self) -> Dict[str, Dict[str, object]]:
         return self._data.get("users", {})
 
+    def reset_all(self) -> int:
+        """Clear all saved availability entries.
+
+        Returns the number of users that were cleared.
+        """
+
+        cleared = len(self._data.get("users", {}))
+        self._data["users"] = {}
+        self._persist()
+        return cleared
+
 
 class GuildConfigStore:
     """Track guild-specific config such as announcement channel and ping role."""

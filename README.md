@@ -6,6 +6,8 @@ A lightweight Discord bot for managing Valorant Premier nights and 5v5 scrim ava
 - Slash commands for collecting player availability (with optional Team A/B tagging).
 - Automatic weekly summary showing Premier readiness (needs 5 from a single team) and scrim readiness (needs 10 total).
 - Posts the schedule into an announcement channel and optionally pings a configured role.
+- Quick signup select menu with a built-in clear button so players can update availability without typing commands.
+- Optional weekly auto-reset so availability clears on a chosen day/hour (default: Mondays at 8 AM server time).
 - Simple JSON persistence—no external database required.
 
 ## Premier & Scrim Rules
@@ -32,6 +34,9 @@ AVAILABLE_ROLE_ID=234567890123456789
 # Optional: map Team A/B to Discord role IDs (e.g., if your roles are named "Group A/B")
 TEAM_A_ROLE_ID=345678901234567890
 TEAM_B_ROLE_ID=456789012345678901
+# Optional: weekly availability reset cadence (server-local time)
+AUTO_RESET_DAY=monday
+AUTO_RESET_HOUR=8
 ```
 
 ### 3) Install and run
@@ -49,17 +54,21 @@ Once the bot is online, run these slash commands in your server:
 - `/config pingrole role:<@role>` — role to ping when posting schedules (optional; overrides `AVAILABLE_ROLE_ID`).
 - `/config teamroles [team_a:<@role>] [team_b:<@role>]` — explicitly map Team A/B to role IDs (useful if your roles are named differently, e.g., **Group A/B**).
 - Players run `/availability set days:<wed, thu, sat> [team:<A|B>]` to register for the week.
+- Post a quick signup UI with `/availability panel` so anyone can click-select their days or clear their week.
 - Staff run `/schedule preview` to see availability and `/schedule post` to send the embed (and ping) to announcements.
 
 ### 5) Data and resets
 - JSON data lives under `data/` (created automatically). Delete the folder to reset availability and config.
-- Re-run `/availability set` each week to refresh player availability.
+- Availability auto-clears weekly on `AUTO_RESET_DAY`/`AUTO_RESET_HOUR` and announces the reset in the announcement channel if configured.
+- Staff can manually clear the week with `/availability resetweek`.
 
 ## Commands
 - `/availability set days:<wed, thu, sat> [team:<A|B>]` — save your availability (team inferred from configured roles if omitted).
 - `/availability mine` — view your saved days.
 - `/availability clear` — remove your availability.
 - `/availability day day:<weekday>` — list who is available on a given day.
+- `/availability panel` — post a select menu + clear button for quick signups in-channel.
+- `/availability resetweek` — (admins) clear all saved availability for a fresh week.
 - `/schedule preview` — view the current Premier/scrim readiness summary.
 - `/schedule post` — send the schedule to the configured announcement channel and ping the availability role if set.
 - `/config announcement channel:<#channel>` — set the channel where schedules are posted.
@@ -72,4 +81,4 @@ Availability and guild configuration are stored as JSON under `data/`. The direc
 ## Notes & Ideas
 - Team detection prioritizes configured role IDs (`/config teamroles` or `TEAM_A_ROLE_ID`/`TEAM_B_ROLE_ID`). Users can also override with the `team` argument if needed.
 - The schedule output highlights whether each Premier slot has enough from Team A or B and how many more players are needed for scrims.
-- Extend this bot with buttons or select menus for quicker signups, or add automatic weekly resets based on your practice cadence.
+- Quick signup select menus and optional weekly auto-resets help the roster stay current without manual cleanup.

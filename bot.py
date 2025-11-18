@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, date
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from scheduler import ScheduleBuilder, WEEK_DAYS
 from storage import AvailabilityStore, GuildConfigStore
@@ -19,6 +20,8 @@ ANNOUNCEMENT_CHANNEL_ID = os.getenv("ANNOUNCEMENT_CHANNEL_ID")
 AVAILABLE_ROLE_ID = os.getenv("AVAILABLE_ROLE_ID")
 TEAM_A_ROLE_ID = os.getenv("TEAM_A_ROLE_ID")
 TEAM_B_ROLE_ID = os.getenv("TEAM_B_ROLE_ID")
+AUTO_RESET_DAY = os.getenv("AUTO_RESET_DAY", "monday").lower()
+AUTO_RESET_HOUR = int(os.getenv("AUTO_RESET_HOUR", "8"))
 
 
 def normalize_day(day: str) -> Optional[str]:
@@ -66,6 +69,55 @@ def format_embed(title: str, description: str) -> discord.Embed:
     return discord.Embed(title=title, description=description, color=discord.Color.brand_red())
 
 
+class AvailabilitySelect(discord.ui.Select):
+    def __init__(self, cog: "AvailabilityCog") -> None:
+        options = [
+            discord.SelectOption(label=day.title(), value=day) for day in WEEK_DAYS
+        ]
+        super().__init__(
+            placeholder="Pick the days you can play",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        saved_days, team = await self.cog._save_availability(member, list(self.values), None)
+        pretty_days = ", ".join(day.title() for day in saved_days)
+        await interaction.response.send_message(
+            f"Saved availability for **{member.display_name}**: {pretty_days} | Team: {team or 'Not set'}",
+            ephemeral=True,
+        )
+
+
+class AvailabilityClearButton(discord.ui.Button):
+    def __init__(self, cog: "AvailabilityCog") -> None:
+        super().__init__(style=discord.ButtonStyle.secondary, label="Clear my week")
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        self.cog.availability_store.clear_user(member.id)
+        await interaction.response.send_message("Cleared your availability for the week.", ephemeral=True)
+
+
+class AvailabilityPanelView(discord.ui.View):
+    def __init__(self, cog: "AvailabilityCog") -> None:
+        super().__init__(timeout=60 * 60)
+        self.add_item(AvailabilitySelect(cog))
+        self.add_item(AvailabilityClearButton(cog))
+
+
 class AvailabilityCog(commands.Cog):
     def __init__(
         self,
@@ -79,6 +131,24 @@ class AvailabilityCog(commands.Cog):
 
     availability = app_commands.Group(name="availability", description="Manage Valorant availability")
 
+    async def _save_availability(
+        self, member: discord.Member, days: List[str], team_override: Optional[str]
+    ) -> Tuple[List[str], Optional[str]]:
+        guild_id = member.guild.id if member.guild else None
+        configured_roles = (
+            self.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
+        )
+        normalized_team = infer_team(member, team_override, configured_roles, env_team_roles())
+        normalized_days = sorted({day.lower() for day in days if normalize_day(day)})
+
+        self.availability_store.set_availability(
+            user_id=member.id,
+            display_name=member.display_name,
+            team=normalized_team,
+            days=normalized_days,
+        )
+        return normalized_days, normalized_team
+
     @availability.command(name="set", description="Set the days you can play this week")
     @app_commands.describe(days="Comma-separated days (e.g. wed, thu, sat)", team="Optional team override (A or B)")
     async def availability_set(
@@ -89,8 +159,6 @@ class AvailabilityCog(commands.Cog):
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
 
-        guild_id = member.guild.id if member.guild else None
-
         normalized_days = parse_days(days)
         if not normalized_days:
             await interaction.response.send_message(
@@ -98,16 +166,7 @@ class AvailabilityCog(commands.Cog):
             )
             return
 
-        configured_roles = (
-            self.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
-        )
-        normalized_team = infer_team(member, team, configured_roles, env_team_roles())
-        self.availability_store.set_availability(
-            user_id=member.id,
-            display_name=member.display_name,
-            team=normalized_team,
-            days=normalized_days,
-        )
+        normalized_days, normalized_team = await self._save_availability(member, normalized_days, team)
 
         pretty_days = ", ".join(day.title() for day in normalized_days)
         team_message = normalized_team or "Not set"
@@ -160,6 +219,46 @@ class AvailabilityCog(commands.Cog):
             description="\n".join(lines),
         )
         await interaction.response.send_message(embed=embed)
+
+    @availability.command(
+        name="panel",
+        description="Post a signup panel with a select menu + clear button for quick updates",
+    )
+    async def availability_panel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message("Run this in a server channel.", ephemeral=True)
+            return
+
+        embed = format_embed(
+            "Weekly Signup Panel",
+            (
+                "Pick your days below to save availability quickly. "
+                "Use the clear button to wipe your week and re-select."
+            ),
+        )
+        view = AvailabilityPanelView(self)
+        await interaction.channel.send(embed=embed, view=view)
+        await interaction.response.send_message("Signup panel posted!", ephemeral=True)
+
+    @availability.command(
+        name="resetweek", description="Admins: clear all saved availability for a fresh week"
+    )
+    async def availability_resetweek(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        if not member.guild_permissions.manage_guild and not member.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You need Manage Server permissions to reset the week.", ephemeral=True
+            )
+            return
+
+        cleared = self.availability_store.reset_all()
+        await interaction.response.send_message(
+            f"Cleared availability for {cleared} players. Fresh week ready!", ephemeral=True
+        )
 
 
 class ScheduleCog(commands.Cog):
@@ -297,6 +396,77 @@ class ConfigCog(commands.Cog):
         )
 
 
+class AutoResetter(commands.Cog):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self._target_weekday = self._resolve_reset_weekday()
+        self.last_reset_date: Optional[date] = None
+        self.auto_reset_task.start()
+
+    def cog_unload(self) -> None:
+        self.auto_reset_task.cancel()
+
+    def _resolve_reset_weekday(self) -> int:
+        try:
+            return WEEK_DAYS.index(AUTO_RESET_DAY)
+        except ValueError:
+            logging.warning("Invalid AUTO_RESET_DAY %s, defaulting to Monday", AUTO_RESET_DAY)
+            return 0
+
+    def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
+        configured = self.config_store.get_announcement_channel(guild.id)
+        if configured:
+            return configured
+        if ANNOUNCEMENT_CHANNEL_ID:
+            return int(ANNOUNCEMENT_CHANNEL_ID)
+        return None
+
+    @tasks.loop(minutes=30)
+    async def auto_reset_task(self) -> None:
+        await self._maybe_reset()
+
+    @auto_reset_task.before_loop
+    async def before_auto_reset_task(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _maybe_reset(self) -> None:
+        now = datetime.now()
+        if now.weekday() != self._target_weekday or now.hour < AUTO_RESET_HOUR:
+            return
+        if self.last_reset_date == now.date():
+            return
+
+        cleared = self.availability_store.reset_all()
+        self.last_reset_date = now.date()
+        logging.info("Auto-reset availability for new week; cleared %d users", cleared)
+        await self._announce_reset(cleared)
+
+    async def _announce_reset(self, cleared: int) -> None:
+        if cleared == 0:
+            return
+        for guild in self.bot.guilds:
+            channel_id = self._resolve_announcement_channel_id(guild)
+            if not channel_id:
+                continue
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                continue
+            try:
+                await channel.send(
+                    f"Weekly reset done: cleared availability for {cleared} players."
+                    " Set your days with /availability set or the signup panel!"
+                )
+            except discord.HTTPException:
+                logging.warning("Failed to announce reset in guild %s", guild.name)
+
+
 def build_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.members = True
@@ -308,6 +478,7 @@ def build_bot() -> commands.Bot:
     bot.add_cog(AvailabilityCog(bot, availability_store, config_store))
     bot.add_cog(ScheduleCog(bot, availability_store, config_store))
     bot.add_cog(ConfigCog(bot, config_store))
+    bot.add_cog(AutoResetter(bot, availability_store, config_store))
 
     @bot.event
     async def on_ready() -> None:
