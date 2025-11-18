@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional
@@ -18,6 +17,7 @@ WEEK_DAYS = [
     "sunday",
 ]
 
+# Default premier windows – can later be overridden by config
 PREMIER_WINDOWS = {
     "wednesday": "7:00-8:00 PM ET",
     "thursday": "7:00-8:00 PM ET",
@@ -26,8 +26,7 @@ PREMIER_WINDOWS = {
     "sunday": "7:00-8:00 PM ET",
 }
 
-DEFAULT_SCRIM_TIME = os.getenv("DEFAULT_SCRIM_START_TIME", "7:00 PM")
-DEFAULT_TIMEZONE = os.getenv("SCRIM_TIMEZONE", "America/New_York")
+DEFAULT_SCRIM_LABEL = "7:00 PM ET"
 
 
 @dataclass
@@ -48,11 +47,10 @@ class DaySummary:
         elif self.premier_window:
             premier_status = f"Premier needs 5 from Team A or B @ {self.premier_window}"
 
-        scrim_status = (
-            f"Scrim ready @ {self.scrim_time_display}"
-            if self.scrim_ready
-            else f"Scrim @ {self.scrim_time_display} needs {max(0, 10 - self.total_available)} more"
-        )
+        if self.scrim_ready:
+            scrim_status = "Scrim ready"
+        else:
+            scrim_status = f"Scrim needs {max(0, 10 - self.total_available)} more"
 
         team_lines = ", ".join(
             f"Team {team}: {count}" for team, count in sorted(self.team_counts.items())
@@ -73,7 +71,18 @@ class ScheduleBuilder:
         self.availability_store = availability_store
         self.config_store = config_store
 
-    def build_week(self, guild_id: Optional[int] = None) -> List[DaySummary]:
+    def build_week(
+        self,
+        premier_windows: Optional[Dict[str, str]] = None,
+    ) -> List[DaySummary]:
+        """Build summaries for the entire week.
+
+        premier_windows:
+            Optional override per day (e.g. from guild config). If not provided,
+            uses the defaults in PREMIER_WINDOWS.
+        """
+        windows = premier_windows or PREMIER_WINDOWS
+
         summaries: List[DaySummary] = []
         timezone = self.config_store.resolve_timezone(guild_id, DEFAULT_TIMEZONE)
         today = date.today()
@@ -82,16 +91,14 @@ class ScheduleBuilder:
             users = self.availability_store.users_for_day(day)
             team_counts: Dict[str, int] = {"A": 0, "B": 0}
             names: List[str] = []
+
             for info in users:
                 team = (info.get("team") or "").upper()
                 if team in team_counts:
                     team_counts[team] += 1
                 names.append(str(info.get("display_name")))
 
-            premier_window = self.config_store.get_premier_window(guild_id, day)
-            if not premier_window:
-                premier_window = PREMIER_WINDOWS.get(day)
-
+            premier_window = windows.get(day)
             premier_team = self._select_premier_team(team_counts) if premier_window else None
             scrim_ready = len(users) >= 10
 
@@ -123,13 +130,15 @@ class ScheduleBuilder:
         return max(qualified, key=qualified.get)
 
     @staticmethod
-    def format_schedule(summaries: List[DaySummary], timezone_name: str) -> str:
+    def format_schedule(
+        summaries: List[DaySummary],
+        scrim_label: str = DEFAULT_SCRIM_LABEL,
+    ) -> str:
         header = (
-            "Valorant Availability — Times shown in "
-            f"{timezone_name} | Scrims target configured per-day start times when 10+ players"
+            "Valorant Availability — Premier Wed-Sun (configurable windows) | "
+            f"Scrims target {scrim_label} if 10+ players"
         )
         lines = [header, ""]
         for summary in summaries:
             lines.append(summary.to_line())
         return "\n".join(lines)
-
