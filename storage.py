@@ -36,6 +36,11 @@ DEFAULT_PREMIER_WINDOWS: Dict[str, Optional[str]] = {
     "sunday": "19:00-20:00",
 }
 
+# Practice: by default OFF for every day
+DEFAULT_PRACTICE_TIMES: Dict[str, Optional[str]] = {
+    day: None for day in WEEK_DAYS
+}
+
 
 class AvailabilityStore:
     """Persist user availability and agent prefs for the week.
@@ -106,7 +111,7 @@ class AvailabilityStore:
         if not entry:
             return
         entry["days"] = []
-        entry["team"] = entry.get("team")
+        # keep team as-is; may still be useful for agents
         self._persist()
 
     def users_for_day(self, day: str) -> List[Dict[str, object]]:
@@ -156,6 +161,7 @@ class AvailabilityStore:
         entry = users.get(key, {})
         entry["display_name"] = display_name
         entry.setdefault("days", [])
+        # team is kept as whatever on_member_update / availability set decides
         entry.setdefault("team", None)
         entry["roles"] = sorted({r.lower() for r in roles})
         entry["agents"] = sorted({a for a in agents})
@@ -181,7 +187,7 @@ class AvailabilityStore:
 
 class GuildConfigStore:
     """Track guild-specific config such as announcement channel, ping role,
-    team roles, scrim times, premier windows, and maps.
+    team roles, scrim times, premier windows, practice, and maps.
     """
 
     def __init__(self, path: Path | str = Path("data/guild_config.json")) -> None:
@@ -212,8 +218,10 @@ class GuildConfigStore:
                 "team_b_role_id": None,
                 "scrim_times": {d: DEFAULT_SCRIM_TIMES[d] for d in WEEK_DAYS},
                 "premier_windows": {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS},
+                "practice_times": {d: DEFAULT_PRACTICE_TIMES[d] for d in WEEK_DAYS},
                 "scrim_maps": {d: None for d in WEEK_DAYS},
                 "premier_maps": {d: None for d in WEEK_DAYS},
+                "practice_maps": {d: None for d in WEEK_DAYS},
             }
         else:
             g = self._data[gid]
@@ -221,15 +229,21 @@ class GuildConfigStore:
             g.setdefault("ping_role_id", None)
             g.setdefault("team_a_role_id", None)
             g.setdefault("team_b_role_id", None)
+
             scrim = g.setdefault("scrim_times", {})
             premier = g.setdefault("premier_windows", {})
+            practice = g.setdefault("practice_times", {})
             scrim_maps = g.setdefault("scrim_maps", {})
             premier_maps = g.setdefault("premier_maps", {})
+            practice_maps = g.setdefault("practice_maps", {})
+
             for d in WEEK_DAYS:
                 scrim.setdefault(d, DEFAULT_SCRIM_TIMES[d])
                 premier.setdefault(d, DEFAULT_PREMIER_WINDOWS[d])
+                practice.setdefault(d, DEFAULT_PRACTICE_TIMES[d])
                 scrim_maps.setdefault(d, None)
                 premier_maps.setdefault(d, None)
+                practice_maps.setdefault(d, None)
         return self._data[gid]
 
     # Announcement channel
@@ -321,6 +335,28 @@ class GuildConfigStore:
         g["premier_windows"] = {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS}
         self._persist()
 
+    # Practice time configuration
+    def set_practice_time(self, guild_id: int, day: str, time_str: Optional[str]) -> None:
+        """time_str examples:
+        - "18:00"
+        - None (turn off practice for that day)
+        """
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        g["practice_times"][day] = time_str
+        self._persist()
+
+    def get_practice_time(self, guild_id: int, day: str) -> Optional[str]:
+        g = self._ensure_guild(guild_id)
+        return g["practice_times"].get(day.lower())
+
+    def reset_practice_times(self, guild_id: int) -> None:
+        g = self._ensure_guild(guild_id)
+        g["practice_times"] = {d: DEFAULT_PRACTICE_TIMES[d] for d in WEEK_DAYS}
+        self._persist()
+
     # Maps configuration
     def set_scrim_map(self, guild_id: int, day: str, map_name: Optional[str]) -> None:
         g = self._ensure_guild(guild_id)
@@ -346,13 +382,99 @@ class GuildConfigStore:
         g = self._ensure_guild(guild_id)
         return g["premier_maps"].get(day.lower())
 
+    def set_practice_map(self, guild_id: int, day: str, map_name: Optional[str]) -> None:
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        g["practice_maps"][day] = map_name
+        self._persist()
+
+    def get_practice_map(self, guild_id: int, day: str) -> Optional[str]:
+        g = self._ensure_guild(guild_id)
+        return g["practice_maps"].get(day.lower())
+
     # Full schedule reset
     def reset_entire_schedule(self, guild_id: int) -> None:
+        """Reset scrim, premier, and practice times to defaults."""
         g = self._ensure_guild(guild_id)
         g["scrim_times"] = {d: DEFAULT_SCRIM_TIMES[d] for d in WEEK_DAYS}
         g["premier_windows"] = {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS}
+        g["practice_times"] = {d: DEFAULT_PRACTICE_TIMES[d] for d in WEEK_DAYS}
         # Do NOT touch maps here so you can keep maps if you want;
-        # comment these two lines in if you want maps reset as well.
+        # uncomment if you ever want maps reset too.
         # g["scrim_maps"] = {d: None for d in WEEK_DAYS}
         # g["premier_maps"] = {d: None for d in WEEK_DAYS}
+        # g["practice_maps"] = {d: None for d in WEEK_DAYS}
         self._persist()
+
+
+class GameLogStore:
+    """Store match logs (scrim/premier/practice) per guild."""
+
+    def __init__(self, path: Path | str = Path("data/match_logs.json")) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: Dict[str, object] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                self._data = json.loads(self.path.read_text())
+            except Exception:
+                self._data = {}
+        else:
+            self._persist()
+
+    def _persist(self) -> None:
+        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+
+    def _guild_logs(self, guild_id: int) -> List[Dict[str, object]]:
+        guilds = self._data.setdefault("guilds", {})
+        if not isinstance(guilds, dict):
+            guilds = {}
+            self._data["guilds"] = guilds
+        gid = str(guild_id)
+        logs = guilds.get(gid)
+        if not isinstance(logs, list):
+            logs = []
+            guilds[gid] = logs
+        return logs
+
+    def add_log(self, guild_id: int, entry: Dict[str, object]) -> int:
+        """Append a log entry and return its ID."""
+        logs = self._guild_logs(guild_id)
+        new_entry = dict(entry)
+        new_entry["id"] = len(logs) + 1
+        logs.append(new_entry)
+        self._persist()
+        return int(new_entry["id"])
+
+    def logs_for_date(self, guild_id: int, date_str: str) -> List[Dict[str, object]]:
+        logs = self._guild_logs(guild_id)
+        return [log for log in logs if log.get("date") == date_str]
+
+    def recent_logs(self, guild_id: int, limit: int = 10) -> List[Dict[str, object]]:
+        logs = self._guild_logs(guild_id)
+        if limit <= 0:
+            return []
+        return logs[-limit:]
+
+    def clear_logs_for_date(self, guild_id: int, date_str: str) -> int:
+        logs = self._guild_logs(guild_id)
+        before = len(logs)
+        logs[:] = [log for log in logs if log.get("date") != date_str]
+        removed = before - len(logs)
+        if removed:
+            self._persist()
+        return removed
+
+    def clear_all_logs(self, guild_id: int) -> int:
+        logs = self._guild_logs(guild_id)
+        removed = len(logs)
+        if removed:
+            guilds = self._data.setdefault("guilds", {})
+            guilds[str(guild_id)] = []
+            self._persist()
+        return removed
