@@ -14,8 +14,12 @@ class DaySummary:
     premier_team: Optional[str]
     premier_window: Optional[str]
     premier_map: Optional[str]
+    practice_time: Optional[str]
+    practice_map: Optional[str]
     scrim_time: Optional[str]
     scrim_map: Optional[str]
+    practice_ready: bool
+    practice_missing: int
     scrim_ready: bool
     scrim_missing: int
     available_names: List[str]
@@ -25,30 +29,48 @@ class DaySummary:
         if self.premier_window is None:
             premier_status = "Premier: **OFF**"
         else:
-            map_suffix = f" · Map: **{self.premier_map}**" if self.premier_map else ""
+            premier_map_suffix = f" · Map: **{self.premier_map}**" if self.premier_map else ""
             if self.premier_team:
                 premier_status = (
-                    f"Premier: **Team {self.premier_team}** @ `{self.premier_window}`{map_suffix}"
+                    f"Premier: **Team {self.premier_team}** @ `{self.premier_window}`"
+                    f"{premier_map_suffix}"
                 )
             else:
                 premier_status = (
-                    f"Premier: needs **5** from Team A or B @ `{self.premier_window}`{map_suffix}"
+                    f"Premier: needs **5** from Team A or B @ `{self.premier_window}`"
+                    f"{premier_map_suffix}"
+                )
+
+        # Practice line
+        if self.practice_time is None:
+            practice_status = "Practice: **OFF**"
+        else:
+            practice_map_suffix = f" · Map: **{self.practice_map}**" if self.practice_map else ""
+            if self.practice_ready:
+                practice_status = (
+                    f"Practice: **READY** ({self.total_available} players) "
+                    f"@ `{self.practice_time}`{practice_map_suffix}"
+                )
+            else:
+                practice_status = (
+                    f"Practice: needs **{self.practice_missing}** more for 5 "
+                    f"@ `{self.practice_time}`{practice_map_suffix}"
                 )
 
         # Scrim line
         if self.scrim_time is None:
             scrim_status = "Scrim: **OFF**"
         else:
-            map_suffix = f" · Map: **{self.scrim_map}**" if self.scrim_map else ""
+            scrim_map_suffix = f" · Map: **{self.scrim_map}**" if self.scrim_map else ""
             if self.scrim_ready:
                 scrim_status = (
                     f"Scrim: **READY** ({self.total_available} players) "
-                    f"@ `{self.scrim_time}`{map_suffix}"
+                    f"@ `{self.scrim_time}`{scrim_map_suffix}"
                 )
             else:
                 scrim_status = (
                     f"Scrim: needs **{self.scrim_missing}** more for 10 "
-                    f"@ `{self.scrim_time}`{map_suffix}"
+                    f"@ `{self.scrim_time}`{scrim_map_suffix}"
                 )
 
         team_lines = ", ".join(
@@ -60,6 +82,7 @@ class DaySummary:
         return (
             f"### {self.day.title()}\n"
             f"- {premier_status}\n"
+            f"- {practice_status}\n"
             f"- {scrim_status}\n"
             f"- Availability: **{self.total_available}** ({names})\n"
             f"- Teams: {team_lines}\n"
@@ -89,12 +112,19 @@ class ScheduleBuilder:
 
             premier_window = self.config_store.get_premier_window(guild_id, day)
             scrim_time = self.config_store.get_scrim_time(guild_id, day)
+            practice_time = self.config_store.get_practice_time(guild_id, day)
+
             premier_map = self.config_store.get_premier_map(guild_id, day)
             scrim_map = self.config_store.get_scrim_map(guild_id, day)
+            practice_map = self.config_store.get_practice_map(guild_id, day)
 
             premier_team = self._select_premier_team(team_counts) if premier_window else None
 
             total = len(users)
+
+            practice_ready = practice_time is not None and total >= 5
+            practice_missing = max(0, 5 - total) if practice_time is not None else 0
+
             scrim_ready = scrim_time is not None and total >= 10
             scrim_missing = max(0, 10 - total) if scrim_time is not None else 0
 
@@ -106,8 +136,12 @@ class ScheduleBuilder:
                     premier_team=premier_team,
                     premier_window=premier_window,
                     premier_map=premier_map,
+                    practice_time=practice_time,
+                    practice_map=practice_map,
                     scrim_time=scrim_time,
                     scrim_map=scrim_map,
+                    practice_ready=practice_ready,
+                    practice_missing=practice_missing,
                     scrim_ready=scrim_ready,
                     scrim_missing=scrim_missing,
                     available_names=names,
@@ -128,7 +162,7 @@ class ScheduleBuilder:
     def format_schedule(guild_name: str, summaries: List[DaySummary]) -> str:
         header = (
             f"## Weekly Valorant Schedule — {guild_name}\n"
-            "_Premier windows, scrim times, and maps are **server-configurable** via `/config`._\n\n"
+            "_Premier windows, scrim times, practice, and maps are **server-configurable** via `/config`._\n\n"
         )
         lines = [header]
         for summary in summaries:
