@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---- Environment helpers ----
 
+
 def _safe_int_env(var_name: str) -> Optional[int]:
     raw = os.getenv(var_name)
     if raw is None:
@@ -46,8 +47,8 @@ except ValueError:
     logging.warning("AUTO_RESET_HOUR is not a number; defaulting to 8")
     AUTO_RESET_HOUR_ENV = 8
 
+# ---- Static data ----
 
-# Valorant maps for dropdowns
 VALORANT_MAPS: List[str] = [
     "Abyss",
     "Ascent",
@@ -63,8 +64,7 @@ VALORANT_MAPS: List[str] = [
     "Sunset",
 ]
 
-# Agent catalog grouped by role (based on official Valorant info up to 2024).
-# Not every very-new agent may be listed; you can extend this if Riot adds more.
+# Agent catalog grouped by role.
 ROLE_AGENTS: Dict[str, List[str]] = {
     "duelist": [
         "Jett",
@@ -250,18 +250,28 @@ class AgentRoleSelect(discord.ui.Select):
 
 class AgentSelect(discord.ui.Select):
     def __init__(self, cog: "AgentsCog") -> None:
+        # Start disabled with no options; will be populated once roles are chosen
         super().__init__(
             placeholder="Pick your agents (multi-select)",
-            min_values=1,
-            max_values=25,
+            min_values=0,
+            max_values=0,
             options=[],
         )
         self.cog = cog
+        self.disabled = True
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         member = interaction.user
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        # Safety: if somehow triggered while disabled / empty
+        if self.disabled or not self.options:
+            await interaction.response.send_message(
+                "Pick at least one **role** first, then choose agents.",
+                ephemeral=True,
+            )
             return
 
         view = self.view
@@ -308,9 +318,21 @@ class AgentSelectView(discord.ui.View):
         for role in self.selected_roles:
             agents.extend(ROLE_AGENTS.get(role, []))
         unique_agents = sorted(set(agents))
+
         self.agent_select.options = [
             discord.SelectOption(label=name, value=name) for name in unique_agents
         ]
+
+        if unique_agents:
+            # Enable multi-select once we have choices
+            self.agent_select.min_values = 1
+            self.agent_select.max_values = min(25, len(unique_agents))
+            self.agent_select.disabled = False
+        else:
+            # No agents (shouldn't really happen, but be safe)
+            self.agent_select.min_values = 0
+            self.agent_select.max_values = 0
+            self.agent_select.disabled = True
 
 
 # -------------------------- Cogs --------------------------
@@ -1241,11 +1263,8 @@ class ValorantBot(commands.Bot):
         before: discord.Member,
         after: discord.Member,
     ) -> None:
-        """Keep stored 'team' in AvailabilityStore in sync with current Discord roles.
+        """Keep stored 'team' in AvailabilityStore in sync with current Discord roles."""
 
-        This fixes the issue where schedule would still show the old team
-        unless the player re-ran /availability.
-        """
         if before.guild is None or after.guild is None:
             return
 
