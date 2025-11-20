@@ -1,26 +1,9 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import discord
-
 from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS
-
-
-def _safe_int_env(var_name: str) -> Optional[int]:
-    raw = os.getenv(var_name)
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-TEAM_A_ROLE_ID_ENV: Optional[int] = _safe_int_env("TEAM_A_ROLE_ID")
-TEAM_B_ROLE_ID_ENV: Optional[int] = _safe_int_env("TEAM_B_ROLE_ID")
 
 
 @dataclass
@@ -30,7 +13,9 @@ class DaySummary:
     team_counts: Dict[str, int]
     premier_team: Optional[str]
     premier_window: Optional[str]
+    premier_map: Optional[str]
     scrim_time: Optional[str]
+    scrim_map: Optional[str]
     scrim_ready: bool
     scrim_missing: int
     available_names: List[str]
@@ -39,18 +24,32 @@ class DaySummary:
         # Premier line
         if self.premier_window is None:
             premier_status = "Premier: **OFF**"
-        elif self.premier_team:
-            premier_status = f"Premier: **Team {self.premier_team}** @ `{self.premier_window}`"
         else:
-            premier_status = f"Premier: needs **5** from Team A or B @ `{self.premier_window}`"
+            map_suffix = f" · Map: **{self.premier_map}**" if self.premier_map else ""
+            if self.premier_team:
+                premier_status = (
+                    f"Premier: **Team {self.premier_team}** @ `{self.premier_window}`{map_suffix}"
+                )
+            else:
+                premier_status = (
+                    f"Premier: needs **5** from Team A or B @ `{self.premier_window}`{map_suffix}"
+                )
 
         # Scrim line
         if self.scrim_time is None:
             scrim_status = "Scrim: **OFF**"
-        elif self.scrim_ready:
-            scrim_status = f"Scrim: **READY** ({self.total_available} players) @ `{self.scrim_time}`"
         else:
-            scrim_status = f"Scrim: needs **{self.scrim_missing}** more for 10 @ `{self.scrim_time}`"
+            map_suffix = f" · Map: **{self.scrim_map}**" if self.scrim_map else ""
+            if self.scrim_ready:
+                scrim_status = (
+                    f"Scrim: **READY** ({self.total_available} players) "
+                    f"@ `{self.scrim_time}`{map_suffix}"
+                )
+            else:
+                scrim_status = (
+                    f"Scrim: needs **{self.scrim_missing}** more for 10 "
+                    f"@ `{self.scrim_time}`{map_suffix}"
+                )
 
         team_lines = ", ".join(
             f"Team {team}: {count}" for team, count in sorted(self.team_counts.items())
@@ -74,13 +73,8 @@ class ScheduleBuilder:
         self.availability_store = availability_store
         self.config_store = config_store
 
-    def build_week(self, guild: discord.Guild) -> List[DaySummary]:
+    def build_week(self, guild_id: int) -> List[DaySummary]:
         summaries: List[DaySummary] = []
-
-        # Get configured team role IDs for this guild, falling back to env if not set
-        team_roles = self.config_store.get_team_roles(guild.id)
-        team_a_id = team_roles.get("A") or TEAM_A_ROLE_ID_ENV
-        team_b_id = team_roles.get("B") or TEAM_B_ROLE_ID_ENV
 
         for day in WEEK_DAYS:
             users = self.availability_store.users_for_day(day)
@@ -88,31 +82,15 @@ class ScheduleBuilder:
             names: List[str] = []
 
             for info in users:
-                user_id = int(info.get("id"))
-                member = guild.get_member(user_id)
-
-                team: Optional[str] = None
-
-                # First preference: live Discord roles if we can see the member
-                if member is not None:
-                    member_role_ids = {r.id for r in member.roles}
-                    if team_a_id and team_a_id in member_role_ids:
-                        team = "A"
-                    elif team_b_id and team_b_id in member_role_ids:
-                        team = "B"
-                else:
-                    # Fallback: stored team value, for members we can't see anymore
-                    stored_team = (str(info.get("team") or "")).upper()
-                    if stored_team in {"A", "B"}:
-                        team = stored_team
-
-                if team in {"A", "B"}:
+                team = (str(info.get("team") or "")).upper()
+                if team in team_counts:
                     team_counts[team] += 1
-
                 names.append(str(info.get("display_name")))
 
-            premier_window = self.config_store.get_premier_window(guild.id, day)
-            scrim_time = self.config_store.get_scrim_time(guild.id, day)
+            premier_window = self.config_store.get_premier_window(guild_id, day)
+            scrim_time = self.config_store.get_scrim_time(guild_id, day)
+            premier_map = self.config_store.get_premier_map(guild_id, day)
+            scrim_map = self.config_store.get_scrim_map(guild_id, day)
 
             premier_team = self._select_premier_team(team_counts) if premier_window else None
 
@@ -127,7 +105,9 @@ class ScheduleBuilder:
                     team_counts=team_counts,
                     premier_team=premier_team,
                     premier_window=premier_window,
+                    premier_map=premier_map,
                     scrim_time=scrim_time,
+                    scrim_map=scrim_map,
                     scrim_ready=scrim_ready,
                     scrim_missing=scrim_missing,
                     available_names=names,
@@ -148,8 +128,7 @@ class ScheduleBuilder:
     def format_schedule(guild_name: str, summaries: List[DaySummary]) -> str:
         header = (
             f"## Weekly Valorant Schedule — {guild_name}\n"
-            "_Premier and scrim windows are **server-configurable**. "
-            "Use `/config` commands to adjust times._\n\n"
+            "_Premier windows, scrim times, and maps are **server-configurable** via `/config`._\n\n"
         )
         lines = [header]
         for summary in summaries:
