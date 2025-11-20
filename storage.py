@@ -38,7 +38,7 @@ DEFAULT_PREMIER_WINDOWS: Dict[str, Optional[str]] = {
 
 
 class AvailabilityStore:
-    """Persist user availability for the week.
+    """Persist user availability and agent prefs for the week.
 
     Data model (JSON):
     {
@@ -46,7 +46,9 @@ class AvailabilityStore:
             "<user_id>": {
                 "display_name": str,
                 "team": Optional[str],
-                "days": ["monday", "tuesday", ...]
+                "days": ["monday", "tuesday", ...],
+                "roles": [str],      # optional: picked Valorant roles
+                "agents": [str]      # optional: picked agents
             }
         }
     }
@@ -62,6 +64,8 @@ class AvailabilityStore:
         if self.path.exists():
             try:
                 self._data = json.loads(self.path.read_text())
+                if "users" not in self._data:
+                    self._data["users"] = {}
             except Exception:
                 # Corrupted file → reset
                 self._data = {"users": {}}
@@ -71,6 +75,8 @@ class AvailabilityStore:
     def _persist(self) -> None:
         self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
 
+    # -------- Availability (days + team) --------
+
     def set_availability(
         self,
         user_id: int,
@@ -78,18 +84,30 @@ class AvailabilityStore:
         team: Optional[str],
         days: Iterable[str],
     ) -> None:
+        """Set days + team, but keep any stored roles/agents."""
         normalized_days = sorted({day.lower() for day in days})
-        self._data.setdefault("users", {})[str(user_id)] = {
-            "display_name": display_name,
-            "team": team,
-            "days": normalized_days,
-        }
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.get(key, {})
+        entry["display_name"] = display_name
+        entry["team"] = team
+        entry["days"] = normalized_days
+        # Preserve existing roles/agents if present
+        entry.setdefault("roles", [])
+        entry.setdefault("agents", [])
+        users[key] = entry
         self._persist()
 
     def clear_user(self, user_id: int) -> None:
-        if str(user_id) in self._data.get("users", {}):
-            del self._data["users"][str(user_id)]
-            self._persist()
+        """Clear this user's availability (days), but leave agents/roles."""
+        users = self._data.get("users", {})
+        key = str(user_id)
+        entry = users.get(key)
+        if not entry:
+            return
+        entry["days"] = []
+        entry["team"] = entry.get("team")
+        self._persist()
 
     def users_for_day(self, day: str) -> List[Dict[str, object]]:
         day = day.lower()
@@ -99,6 +117,8 @@ class AvailabilityStore:
                 "id": int(user_id),
                 "display_name": info.get("display_name", "Unknown"),
                 "team": info.get("team"),
+                "roles": info.get("roles", []),
+                "agents": info.get("agents", []),
             }
             for user_id, info in users.items()
             if day in info.get("days", [])
@@ -111,19 +131,57 @@ class AvailabilityStore:
         return self._data.get("users", {})
 
     def reset_all(self) -> int:
-        """Clear all saved availability entries.
+        """Clear all saved availability entries (days), keep roles/agents.
 
-        Returns the number of users that were cleared.
+        Returns the number of users whose availability was cleared.
         """
-        cleared = len(self._data.get("users", {}))
-        self._data["users"] = {}
+        users = self._data.get("users", {})
+        cleared = len(users)
+        for info in users.values():
+            info["days"] = []
         self._persist()
         return cleared
+
+    # -------- Agent / role preferences --------
+
+    def set_agents(
+        self,
+        user_id: int,
+        display_name: str,
+        roles: Iterable[str],
+        agents: Iterable[str],
+    ) -> None:
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.get(key, {})
+        entry["display_name"] = display_name
+        entry.setdefault("days", [])
+        entry.setdefault("team", None)
+        entry["roles"] = sorted({r.lower() for r in roles})
+        entry["agents"] = sorted({a for a in agents})
+        users[key] = entry
+        self._persist()
+
+    def get_user_agents(self, user_id: int) -> Dict[str, List[str]]:
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        roles = list(entry.get("roles", []) or [])
+        agents = list(entry.get("agents", []) or [])
+        return {"roles": roles, "agents": agents}
+
+    def clear_agents(self, user_id: int) -> None:
+        users = self._data.get("users", {})
+        key = str(user_id)
+        entry = users.get(key)
+        if not entry:
+            return
+        entry.pop("roles", None)
+        entry.pop("agents", None)
+        self._persist()
 
 
 class GuildConfigStore:
     """Track guild-specific config such as announcement channel, ping role,
-    team roles, scrim times, and premier windows.
+    team roles, scrim times, premier windows, and maps.
     """
 
     def __init__(self, path: Path | str = Path("data/guild_config.json")) -> None:
@@ -154,9 +212,10 @@ class GuildConfigStore:
                 "team_b_role_id": None,
                 "scrim_times": {d: DEFAULT_SCRIM_TIMES[d] for d in WEEK_DAYS},
                 "premier_windows": {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS},
+                "scrim_maps": {d: None for d in WEEK_DAYS},
+                "premier_maps": {d: None for d in WEEK_DAYS},
             }
         else:
-            # Ensure keys exist even if file is from an older version
             g = self._data[gid]
             g.setdefault("announcement_channel_id", None)
             g.setdefault("ping_role_id", None)
@@ -164,9 +223,13 @@ class GuildConfigStore:
             g.setdefault("team_b_role_id", None)
             scrim = g.setdefault("scrim_times", {})
             premier = g.setdefault("premier_windows", {})
+            scrim_maps = g.setdefault("scrim_maps", {})
+            premier_maps = g.setdefault("premier_maps", {})
             for d in WEEK_DAYS:
                 scrim.setdefault(d, DEFAULT_SCRIM_TIMES[d])
                 premier.setdefault(d, DEFAULT_PREMIER_WINDOWS[d])
+                scrim_maps.setdefault(d, None)
+                premier_maps.setdefault(d, None)
         return self._data[gid]
 
     # Announcement channel
@@ -258,9 +321,38 @@ class GuildConfigStore:
         g["premier_windows"] = {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS}
         self._persist()
 
+    # Maps configuration
+    def set_scrim_map(self, guild_id: int, day: str, map_name: Optional[str]) -> None:
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        g["scrim_maps"][day] = map_name
+        self._persist()
+
+    def get_scrim_map(self, guild_id: int, day: str) -> Optional[str]:
+        g = self._ensure_guild(guild_id)
+        return g["scrim_maps"].get(day.lower())
+
+    def set_premier_map(self, guild_id: int, day: str, map_name: Optional[str]) -> None:
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        g["premier_maps"][day] = map_name
+        self._persist()
+
+    def get_premier_map(self, guild_id: int, day: str) -> Optional[str]:
+        g = self._ensure_guild(guild_id)
+        return g["premier_maps"].get(day.lower())
+
     # Full schedule reset
     def reset_entire_schedule(self, guild_id: int) -> None:
         g = self._ensure_guild(guild_id)
         g["scrim_times"] = {d: DEFAULT_SCRIM_TIMES[d] for d in WEEK_DAYS}
         g["premier_windows"] = {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS}
+        # Do NOT touch maps here so you can keep maps if you want;
+        # comment these two lines in if you want maps reset as well.
+        # g["scrim_maps"] = {d: None for d in WEEK_DAYS}
+        # g["premier_maps"] = {d: None for d in WEEK_DAYS}
         self._persist()
