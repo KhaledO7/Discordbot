@@ -250,28 +250,19 @@ class AgentRoleSelect(discord.ui.Select):
 
 class AgentSelect(discord.ui.Select):
     def __init__(self, cog: "AgentsCog") -> None:
-        # Start disabled with no options; will be populated once roles are chosen
+        # Options + min/max will be overridden by AgentSelectView.refresh_agent_options
         super().__init__(
             placeholder="Pick your agents (multi-select)",
-            min_values=0,
-            max_values=0,
+            min_values=1,
+            max_values=25,
             options=[],
         )
         self.cog = cog
-        self.disabled = True
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         member = interaction.user
         if not isinstance(member, discord.Member):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        # Safety: if somehow triggered while disabled / empty
-        if self.disabled or not self.options:
-            await interaction.response.send_message(
-                "Pick at least one **role** first, then choose agents.",
-                ephemeral=True,
-            )
             return
 
         view = self.view
@@ -309,9 +300,8 @@ class AgentSelectView(discord.ui.View):
         self.cog = cog
         self.selected_roles: List[str] = []
         self.role_select = AgentRoleSelect(cog)
-        self.agent_select = AgentSelect(cog)
+        self.agent_select: Optional[AgentSelect] = None  # added later
         self.add_item(self.role_select)
-        self.add_item(self.agent_select)
 
     def refresh_agent_options(self) -> None:
         agents: List[str] = []
@@ -319,19 +309,24 @@ class AgentSelectView(discord.ui.View):
             agents.extend(ROLE_AGENTS.get(role, []))
         unique_agents = sorted(set(agents))
 
+        if self.agent_select is None:
+            # First time: create the select and add to the view
+            self.agent_select = AgentSelect(self.cog)
+            self.add_item(self.agent_select)
+
         self.agent_select.options = [
             discord.SelectOption(label=name, value=name) for name in unique_agents
         ]
 
+        # Make sure min/max are valid given the options
         if unique_agents:
-            # Enable multi-select once we have choices
             self.agent_select.min_values = 1
             self.agent_select.max_values = min(25, len(unique_agents))
             self.agent_select.disabled = False
         else:
-            # No agents (shouldn't really happen, but be safe)
-            self.agent_select.min_values = 0
-            self.agent_select.max_values = 0
+            # Failsafe; should never really happen because each role has agents
+            self.agent_select.min_values = 1
+            self.agent_select.max_values = 1
             self.agent_select.disabled = True
 
 
@@ -1036,7 +1031,6 @@ class AgentsCog(commands.Cog):
 
         target = team.value  # "A", "B", or "ALL"
         users = self.availability_store.all_users()
-        # Team membership is stored in availability_store (kept in sync via on_member_update)
         bucket: Dict[str, List[str]] = {}
 
         for user_id, info in users.items():
@@ -1100,7 +1094,6 @@ class RoleSyncCog(commands.Cog):
         return WEEK_DAYS[idx]
 
     def _resolve_ping_role_id(self, guild: discord.Guild) -> Optional[int]:
-        # guild-specific ping role beats env AVAILABLE_ROLE_ID
         return self.config_store.get_ping_role(guild.id) or AVAILABLE_ROLE_ID_ENV
 
     async def _sync_roles_for_guild(self, guild: discord.Guild) -> None:
@@ -1139,7 +1132,6 @@ class RoleSyncCog(commands.Cog):
         """Periodically sync roles and run weekly reset if configured."""
         now = datetime.now()
 
-        # Weekly reset of availability (optional; uses env vars)
         should_reset = (
             now.weekday() == self._target_weekday_index
             and now.hour >= AUTO_RESET_HOUR_ENV
@@ -1150,7 +1142,6 @@ class RoleSyncCog(commands.Cog):
             self._last_reset_date = now.date()
             logging.info("Auto-reset availability for new week; cleared %d users", cleared)
 
-        # Always keep today's availability role in sync
         for guild in self.bot.guilds:
             await self._sync_roles_for_guild(guild)
 
@@ -1174,7 +1165,6 @@ class RoleSyncCog(commands.Cog):
         target_dt = datetime.combine(now.date(), scrim_time)
         delta = target_dt - now
 
-        # We want to ping between 25 and 35 minutes before start time
         if not (timedelta(minutes=25) <= delta <= timedelta(minutes=35)):
             return
 
@@ -1192,7 +1182,6 @@ class RoleSyncCog(commands.Cog):
         by_team = any(c >= 5 for c in team_counts.values())
         by_total = total >= 10
 
-        # New rule: ping if 10 total OR >=5 from one team
         if not (by_team or by_total):
             return
 
@@ -1278,7 +1267,6 @@ class ValorantBot(commands.Bot):
 
         days = self.availability_store.get_user_days(after.id)
         if not days:
-            # No availability saved; nothing to update
             return
 
         self.availability_store.set_availability(
