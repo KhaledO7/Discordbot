@@ -47,6 +47,64 @@ except ValueError:
     AUTO_RESET_HOUR_ENV = 8
 
 
+# Valorant maps for dropdowns
+VALORANT_MAPS: List[str] = [
+    "Abyss",
+    "Ascent",
+    "Breeze",
+    "Bind",
+    "Corrode",
+    "Fracture",
+    "Haven",
+    "Icebox",
+    "Lotus",
+    "Pearl",
+    "Split",
+    "Sunset",
+]
+
+# Agent catalog grouped by role (based on official Valorant info up to 2024).
+# Not every very-new agent may be listed; you can extend this if Riot adds more.
+ROLE_AGENTS: Dict[str, List[str]] = {
+    "duelist": [
+        "Jett",
+        "Phoenix",
+        "Reyna",
+        "Raze",
+        "Yoru",
+        "Neon",
+        "Iso",
+        "Waylay",
+    ],
+    "initiator": [
+        "Sova",
+        "Breach",
+        "Skye",
+        "KAY/O",
+        "Fade",
+        "Gekko",
+        "Tejo",
+    ],
+    "sentinel": [
+        "Sage",
+        "Cypher",
+        "Killjoy",
+        "Chamber",
+        "Deadlock",
+        "Vyse",
+        "Veto",
+    ],
+    "controller": [
+        "Brimstone",
+        "Viper",
+        "Omen",
+        "Astra",
+        "Harbor",
+        "Clove",
+    ],
+}
+
+
 def normalize_day(day: str) -> Optional[str]:
     day = day.strip().lower()
     for candidate in WEEK_DAYS:
@@ -104,6 +162,9 @@ def _parse_hhmm_to_time(label: str) -> Optional[time]:
         return None
 
 
+# -------------------------- Availability UI --------------------------
+
+
 class AvailabilitySelect(discord.ui.Select):
     def __init__(self, cog: "AvailabilityCog") -> None:
         options = [discord.SelectOption(label=day.title(), value=day) for day in WEEK_DAYS]
@@ -149,6 +210,110 @@ class AvailabilityPanelView(discord.ui.View):
         super().__init__(timeout=60 * 60)
         self.add_item(AvailabilitySelect(cog))
         self.add_item(AvailabilityClearButton(cog))
+
+
+# -------------------------- Agents UI --------------------------
+
+
+class AgentRoleSelect(discord.ui.Select):
+    def __init__(self, cog: "AgentsCog") -> None:
+        options = [
+            discord.SelectOption(label=role.title(), value=role)
+            for role in ROLE_AGENTS.keys()
+        ]
+        super().__init__(
+            placeholder="Pick one or more roles",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        view = self.view
+        if not isinstance(view, AgentSelectView):
+            await interaction.response.send_message("Internal view error.", ephemeral=True)
+            return
+
+        view.selected_roles = list(self.values)
+        view.refresh_agent_options()
+
+        await interaction.response.edit_message(
+            content="Now pick which agents you play on those roles:",
+            view=view,
+        )
+
+
+class AgentSelect(discord.ui.Select):
+    def __init__(self, cog: "AgentsCog") -> None:
+        super().__init__(
+            placeholder="Pick your agents (multi-select)",
+            min_values=1,
+            max_values=25,
+            options=[],
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        view = self.view
+        if not isinstance(view, AgentSelectView):
+            await interaction.response.send_message("Internal view error.", ephemeral=True)
+            return
+
+        roles = view.selected_roles
+        agents = list(self.values)
+
+        if not roles:
+            await interaction.response.send_message(
+                "Pick at least one role first, then choose agents.", ephemeral=True
+            )
+            return
+
+        self.cog.availability_store.set_agents(
+            user_id=member.id,
+            display_name=member.display_name,
+            roles=roles,
+            agents=agents,
+        )
+
+        pretty_roles = ", ".join(r.title() for r in roles)
+        pretty_agents = ", ".join(agents)
+        await interaction.response.send_message(
+            f"Saved your agents!\nRoles: **{pretty_roles}**\nAgents: **{pretty_agents}**",
+            ephemeral=True,
+        )
+
+
+class AgentSelectView(discord.ui.View):
+    def __init__(self, cog: "AgentsCog") -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.selected_roles: List[str] = []
+        self.role_select = AgentRoleSelect(cog)
+        self.agent_select = AgentSelect(cog)
+        self.add_item(self.role_select)
+        self.add_item(self.agent_select)
+
+    def refresh_agent_options(self) -> None:
+        agents: List[str] = []
+        for role in self.selected_roles:
+            agents.extend(ROLE_AGENTS.get(role, []))
+        unique_agents = sorted(set(agents))
+        self.agent_select.options = [
+            discord.SelectOption(label=name, value=name) for name in unique_agents
+        ]
+
+
+# -------------------------- Cogs --------------------------
 
 
 class AvailabilityCog(commands.Cog):
@@ -316,7 +481,7 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week(interaction.guild)
+        summaries = self.schedule_builder.build_week(interaction.guild.id)
         text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
         await interaction.response.send_message(embed=embed)
@@ -327,7 +492,7 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week(interaction.guild)
+        summaries = self.schedule_builder.build_week(interaction.guild.id)
         text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
 
@@ -348,6 +513,54 @@ class ScheduleCog(commands.Cog):
         content = f"{mention} Weekly schedule updated!" if mention else "Weekly schedule updated!"
         await channel.send(content=content, embed=embed)
         await interaction.response.send_message("Schedule posted!", ephemeral=True)
+
+    @schedule.command(
+        name="pingcheck",
+        description="Check if current numbers would trigger a scrim ping for a given day",
+    )
+    @app_commands.describe(day="Day of week (e.g. friday)")
+    async def schedule_pingcheck(self, interaction: discord.Interaction, day: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        norm_day = normalize_day(day)
+        if not norm_day:
+            await interaction.response.send_message("Invalid day. Try monday, tuesday, etc.", ephemeral=True)
+            return
+
+        users = self.availability_store.users_for_day(norm_day)
+        total = len(users)
+        team_counts: Dict[str, int] = {"A": 0, "B": 0}
+        for info in users:
+            t = str(info.get("team") or "").upper()
+            if t in team_counts:
+                team_counts[t] += 1
+
+        scrim_time = self.config_store.get_scrim_time(interaction.guild.id, norm_day)
+        premier_window = self.config_store.get_premier_window(interaction.guild.id, norm_day)
+
+        by_team = any(c >= 5 for c in team_counts.values())
+        by_total = total >= 10
+
+        will_ping = scrim_time is not None and (by_team or by_total)
+
+        desc_lines = [
+            f"**Day:** {norm_day.title()}",
+            f"**Total available:** {total}",
+            f"**Team A:** {team_counts['A']} · **Team B:** {team_counts['B']}",
+            f"**Scrim time:** `{scrim_time}`" if scrim_time else "**Scrim time:** OFF",
+            f"**Premier window:** `{premier_window}`" if premier_window else "**Premier:** OFF",
+            "",
+            "A scrim ping will trigger 30 minutes before the scrim time if:",
+            "- At least **10 total** players are available, **or**",
+            "- At least **5 players** from **one team** are available.",
+            "",
+            f"**Would ping with current numbers?** {'✅ Yes' if will_ping else '❌ No'}",
+        ]
+
+        embed = format_embed("Scrim Ping Check", "\n".join(desc_lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
         configured = self.config_store.get_announcement_channel(guild.id)
@@ -372,7 +585,7 @@ class ConfigCog(commands.Cog):
         self.bot = bot
         self.config_store = config_store
 
-    config = app_commands.Group(name="config", description="Configure announcements, pings and times")
+    config = app_commands.Group(name="config", description="Configure announcements, pings, times, maps")
 
     @config.command(name="announcement", description="Set the channel for weekly announcements")
     @app_commands.describe(channel="Channel to post schedules to")
@@ -387,7 +600,7 @@ class ConfigCog(commands.Cog):
         )
 
     @config.command(name="pingrole", description="Set the role to ping when posting schedules")
-    @app_commands.describe(role="Role to mention for availability updates")
+    @app_commands.describe(role="Role to mention for availability updates and scrim pings")
     async def config_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
@@ -455,7 +668,6 @@ class ConfigCog(commands.Cog):
             await interaction.response.send_message("Invalid day. Try monday, tuesday, etc.", ephemeral=True)
             return
 
-        # Admin check
         member = interaction.user
         if not isinstance(member, discord.Member) or not (
             member.guild_permissions.manage_guild or member.guild_permissions.administrator
@@ -465,7 +677,6 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        # "off" disables scrims that day
         if time_label.lower() in {"off", "none", "disable"}:
             self.config_store.set_scrim_time(interaction.guild.id, norm_day, None)
             await interaction.response.send_message(
@@ -558,7 +769,6 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        # Very light validation: expect "HH:MM-HH:MM"
         parts = window.split("-")
         if len(parts) != 2 or _parse_hhmm_to_time(parts[0]) is None or _parse_hhmm_to_time(parts[1]) is None:
             await interaction.response.send_message(
@@ -623,6 +833,213 @@ class ConfigCog(commands.Cog):
             label = w if w is not None else "OFF"
             lines.append(f"**{d.title()}**: `{label}`")
         embed = format_embed("Current Premier Windows", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ----- Map configuration -----
+
+    @config.command(
+        name="map_premier",
+        description="Set the Premier map for a given day",
+    )
+    @app_commands.describe(
+        day="Day of week (e.g. wednesday)",
+        map_name="Map to play for Premier on that day",
+    )
+    @app_commands.choices(
+        map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
+    )
+    async def config_map_premier(
+        self,
+        interaction: discord.Interaction,
+        day: str,
+        map_name: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        norm_day = normalize_day(day)
+        if not norm_day:
+            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set maps.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_premier_map(interaction.guild.id, norm_day, map_name.value)
+        await interaction.response.send_message(
+            f"Premier map for **{norm_day.title()}** set to **{map_name.value}**.",
+            ephemeral=True,
+        )
+
+    @config.command(
+        name="map_scrim",
+        description="Set the Scrim map for a given day",
+    )
+    @app_commands.describe(
+        day="Day of week (e.g. wednesday)",
+        map_name="Map to scrim on that day",
+    )
+    @app_commands.choices(
+        map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
+    )
+    async def config_map_scrim(
+        self,
+        interaction: discord.Interaction,
+        day: str,
+        map_name: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        norm_day = normalize_day(day)
+        if not norm_day:
+            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set maps.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_scrim_map(interaction.guild.id, norm_day, map_name.value)
+        await interaction.response.send_message(
+            f"Scrim map for **{norm_day.title()}** set to **{map_name.value}**.",
+            ephemeral=True,
+        )
+
+    @config.command(name="check_maps", description="Show current Premier/Scrim maps for all days")
+    async def config_check_maps(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        lines: List[str] = []
+        for d in WEEK_DAYS:
+            p = self.config_store.get_premier_map(interaction.guild.id, d)
+            s = self.config_store.get_scrim_map(interaction.guild.id, d)
+            p_label = p if p is not None else "—"
+            s_label = s if s is not None else "—"
+            lines.append(f"**{d.title()}** · Premier: `{p_label}` · Scrim: `{s_label}`")
+
+        embed = format_embed("Current Maps", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AgentsCog(commands.Cog):
+    """Let players declare the roles/agents they play and inspect team agent comps."""
+
+    def __init__(self, bot: commands.Bot, availability_store: AvailabilityStore, config_store: GuildConfigStore) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+
+    agents = app_commands.Group(name="agents", description="Pick and inspect Valorant agents")
+
+    @agents.command(name="set", description="Pick your roles and agents via dropdowns")
+    async def agents_set(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        view = AgentSelectView(self)
+        await interaction.response.send_message(
+            "Pick your **roles** first, then pick your **agents**.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @agents.command(name="clear", description="Clear your saved roles/agents")
+    async def agents_clear(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.availability_store.clear_agents(member.id)
+        await interaction.response.send_message("Cleared your saved agents.", ephemeral=True)
+
+    @agents.command(name="mine", description="View your saved roles/agents")
+    async def agents_mine(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        info = self.availability_store.get_user_agents(member.id)
+        roles = info["roles"]
+        agents = info["agents"]
+
+        if not roles and not agents:
+            await interaction.response.send_message("You don't have any agents saved yet.", ephemeral=True)
+            return
+
+        lines = [
+            f"**Roles:** {', '.join(r.title() for r in roles) if roles else '—'}",
+            f"**Agents:** {', '.join(agents) if agents else '—'}",
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @agents.command(
+        name="team",
+        description="Show agents played by Team A, Team B, or all players",
+    )
+    @app_commands.describe(team="Which team to inspect")
+    @app_commands.choices(
+        team=[
+            app_commands.Choice(name="Team A", value="A"),
+            app_commands.Choice(name="Team B", value="B"),
+            app_commands.Choice(name="All", value="ALL"),
+        ]
+    )
+    async def agents_team(
+        self,
+        interaction: discord.Interaction,
+        team: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        target = team.value  # "A", "B", or "ALL"
+        users = self.availability_store.all_users()
+        # Team membership is stored in availability_store (kept in sync via on_member_update)
+        bucket: Dict[str, List[str]] = {}
+
+        for user_id, info in users.items():
+            user_team = (str(info.get("team") or "")).upper()
+            if target != "ALL" and user_team != target:
+                continue
+            agents = info.get("agents") or []
+            if not agents:
+                continue
+            name = str(info.get("display_name", f"User {user_id}"))
+            bucket[name] = list(agents)
+
+        if not bucket:
+            label = "all teams" if target == "ALL" else f"Team {target}"
+            await interaction.response.send_message(
+                f"No saved agents found for {label}.", ephemeral=True
+            )
+            return
+
+        lines: List[str] = []
+        for name, agents in bucket.items():
+            lines.append(f"**{name}**: {', '.join(agents)}")
+
+        label = "all teams" if target == "ALL" else f"Team {target}"
+        embed = format_embed(f"Agents for {label}", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -740,7 +1157,21 @@ class RoleSyncCog(commands.Cog):
             return
 
         users = self.availability_store.users_for_day(today_label)
-        if len(users) < 10:
+        if not users:
+            return
+
+        team_counts: Dict[str, int] = {"A": 0, "B": 0}
+        for info in users:
+            t = str(info.get("team") or "").upper()
+            if t in team_counts:
+                team_counts[t] += 1
+
+        total = len(users)
+        by_team = any(c >= 5 for c in team_counts.values())
+        by_total = total >= 10
+
+        # New rule: ping if 10 total OR >=5 from one team
+        if not (by_team or by_total):
             return
 
         channel_id = self.config_store.get_announcement_channel(guild.id) or ANNOUNCEMENT_CHANNEL_ID_ENV
@@ -761,7 +1192,8 @@ class RoleSyncCog(commands.Cog):
         try:
             await channel.send(
                 f"{mention}Scrim is **today** at `{scrim_time_label}` "
-                f"({len(users)} players signed). This is your 30-minute reminder."
+                f"({total} players signed, Team A: {team_counts['A']}, Team B: {team_counts['B']}). "
+                f"This is your 30-minute reminder."
             )
         except discord.HTTPException:
             logging.warning("Failed to send scrim reminder in %s", guild.name)
@@ -791,6 +1223,7 @@ class ValorantBot(commands.Bot):
         await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
         await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
         await self.add_cog(ConfigCog(self, self.config_store))
+        await self.add_cog(AgentsCog(self, self.availability_store, self.config_store))
         await self.add_cog(RoleSyncCog(self, self.availability_store, self.config_store))
 
         try:
@@ -802,6 +1235,39 @@ class ValorantBot(commands.Bot):
     async def on_ready(self) -> None:  # type: ignore[override]
         assert self.user is not None
         logging.info("Logged in as %s", self.user)
+
+    async def on_member_update(  # type: ignore[override]
+        self,
+        before: discord.Member,
+        after: discord.Member,
+    ) -> None:
+        """Keep stored 'team' in AvailabilityStore in sync with current Discord roles.
+
+        This fixes the issue where schedule would still show the old team
+        unless the player re-ran /availability.
+        """
+        if before.guild is None or after.guild is None:
+            return
+
+        before_ids = {r.id for r in before.roles}
+        after_ids = {r.id for r in after.roles}
+        if before_ids == after_ids:
+            return  # no role change
+
+        configured_roles = self.config_store.get_team_roles(after.guild.id)
+        new_team = infer_team(after, None, configured_roles, env_team_roles())
+
+        days = self.availability_store.get_user_days(after.id)
+        if not days:
+            # No availability saved; nothing to update
+            return
+
+        self.availability_store.set_availability(
+            user_id=after.id,
+            display_name=after.display_name,
+            team=new_team,
+            days=days,
+        )
 
 
 def main() -> None:
