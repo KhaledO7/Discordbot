@@ -416,27 +416,29 @@ class AvailabilityCog(commands.Cog):
         pretty_days = ", ".join(day.title() for day in days)
         await interaction.response.send_message(f"You are marked available on: {pretty_days}", ephemeral=True)
 
-    @availability.command(name="day", description="See everyone available for a given day")
-    @app_commands.describe(day="Day of week (e.g. friday)")
-    async def availability_day(self, interaction: discord.Interaction, day: str) -> None:
-        normalized = normalize_day(day)
-        if not normalized:
-            await interaction.response.send_message("Please provide a valid day.", ephemeral=True)
+    @availability.command(name="day", description="See everyone available for one or more days")
+    @app_commands.describe(days="Day or comma-separated days (e.g. friday, saturday)")
+    async def availability_day(self, interaction: discord.Interaction, days: str) -> None:
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message("Please provide at least one valid day.", ephemeral=True)
             return
 
-        users = self.availability_store.users_for_day(normalized)
-        if not users:
-            await interaction.response.send_message(
-                f"No one has signed up for {normalized.title()} yet.", ephemeral=True
-            )
-            return
+        chunks: List[str] = []
+        for d in norm_days:
+            users = self.availability_store.users_for_day(d)
+            if not users:
+                chunks.append(f"**{d.title()}** — no one has signed up.\n")
+                continue
 
-        lines = [f"{user['display_name']} (Team {user.get('team') or 'Not set'})" for user in users]
+            lines = [f"{user['display_name']} (Team {user.get('team') or 'Not set'})" for user in users]
+            chunks.append(f"**{d.title()}**\n" + "\n".join(lines) + "\n")
+
         embed = format_embed(
-            title=f"Availability for {normalized.title()}",
-            description="\n".join(lines),
+            title="Availability by Day",
+            description="\n".join(chunks),
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @availability.command(
         name="panel",
@@ -534,57 +536,63 @@ class ScheduleCog(commands.Cog):
 
     @schedule.command(
         name="pingcheck",
-        description="Check if current numbers would trigger scrim/practice pings for a given day",
+        description="Check if current numbers would trigger scrim/practice pings for one or more days",
     )
-    @app_commands.describe(day="Day of week (e.g. friday)")
-    async def schedule_pingcheck(self, interaction: discord.Interaction, day: str) -> None:
+    @app_commands.describe(days="Day or comma-separated days (e.g. friday, saturday)")
+    async def schedule_pingcheck(self, interaction: discord.Interaction, days: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try monday, tuesday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message("Invalid days. Try `monday, friday` etc.", ephemeral=True)
             return
 
-        users = self.availability_store.users_for_day(norm_day)
-        total = len(users)
-        team_counts: Dict[str, int] = {"A": 0, "B": 0}
-        for info in users:
-            t = str(info.get("team") or "").upper()
-            if t in team_counts:
-                team_counts[t] += 1
+        guild_id = interaction.guild.id
+        blocks: List[str] = []
 
-        scrim_time = self.config_store.get_scrim_time(interaction.guild.id, norm_day)
-        premier_window = self.config_store.get_premier_window(interaction.guild.id, norm_day)
-        practice_time = self.config_store.get_practice_time(interaction.guild.id, norm_day)
+        for norm_day in norm_days:
+            users = self.availability_store.users_for_day(norm_day)
+            total = len(users)
+            team_counts: Dict[str, int] = {"A": 0, "B": 0}
+            for info in users:
+                t = str(info.get("team") or "").upper()
+                if t in team_counts:
+                    team_counts[t] += 1
 
-        by_team = any(c >= 5 for c in team_counts.values())
-        by_total = total >= 10
-        scrim_will_ping = scrim_time is not None and (by_team or by_total)
+            scrim_time = self.config_store.get_scrim_time(guild_id, norm_day)
+            premier_window = self.config_store.get_premier_window(guild_id, norm_day)
+            practice_time = self.config_store.get_practice_time(guild_id, norm_day)
 
-        practice_will_ping = practice_time is not None and total >= 5
+            by_team = any(c >= 5 for c in team_counts.values())
+            by_total = total >= 10
+            scrim_will_ping = scrim_time is not None and (by_team or by_total)
+            practice_will_ping = practice_time is not None and total >= 5
 
-        desc_lines = [
-            f"**Day:** {norm_day.title()}",
-            f"**Total available:** {total}",
-            f"**Team A:** {team_counts['A']} · **Team B:** {team_counts['B']}",
-            f"**Scrim time:** `{scrim_time}`" if scrim_time else "**Scrim time:** OFF",
-            f"**Practice time:** `{practice_time}`" if practice_time else "**Practice time:** OFF",
-            f"**Premier window:** `{premier_window}`" if premier_window else "**Premier:** OFF",
-            "",
+            lines = [
+                f"**{norm_day.title()}**",
+                f"- Total available: **{total}**",
+                f"- Team A: **{team_counts['A']}** · Team B: **{team_counts['B']}**",
+                f"- Scrim time: `{scrim_time}`" if scrim_time else "- Scrim time: **OFF**",
+                f"- Practice time: `{practice_time}`" if practice_time else "- Practice time: **OFF**",
+                f"- Premier window: `{premier_window}`" if premier_window else "- Premier: **OFF**",
+                f"- Scrim ping now? {'✅ Yes' if scrim_will_ping else '❌ No'}",
+                f"- Practice ping now? {'✅ Yes' if practice_will_ping else '❌ No'}",
+                "",
+            ]
+            blocks.extend(lines)
+
+        blocks.extend([
             "Scrim ping (30 minutes before) triggers if:",
             "- At least **10 total** players are available, **or**",
             "- At least **5 players** from **one team** are available.",
             "",
             "Practice ping (30 minutes before) triggers if:",
             "- At least **5 total** players are available.",
-            "",
-            f"**Scrim ping with current numbers?** {'✅ Yes' if scrim_will_ping else '❌ No'}",
-            f"**Practice ping with current numbers?** {'✅ Yes' if practice_will_ping else '❌ No'}",
-        ]
+        ])
 
-        embed = format_embed("Scrim / Practice Ping Check", "\n".join(desc_lines))
+        embed = format_embed("Scrim / Practice Ping Check", "\n".join(blocks))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
@@ -945,16 +953,15 @@ class ConfigCog(commands.Cog):
         embed = format_embed("Current Premier Windows", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ----- Map configuration -----
-
+    # ----- Map configuration (now supports multiple days per command) -----
 
     @config.command(
         name="map_premier",
-        description="Set the Premier map for a given day",
+        description="Set the Premier map for one or more days",
     )
     @app_commands.describe(
-        day="Day of week (e.g. wednesday)",
-        map_name="Map to play for Premier on that day",
+        days="Day or comma-separated days (e.g. wednesday, thursday)",
+        map_name="Map to play for Premier on those days",
     )
     @app_commands.choices(
         map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
@@ -962,16 +969,16 @@ class ConfigCog(commands.Cog):
     async def config_map_premier(
         self,
         interaction: discord.Interaction,
-        day: str,
+        days: str,
         map_name: app_commands.Choice[str],
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message("Invalid day(s). Try `wednesday, thursday`.", ephemeral=True)
             return
 
         member = interaction.user
@@ -983,19 +990,22 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        self.config_store.set_premier_map(interaction.guild.id, norm_day, map_name.value)
+        for d in norm_days:
+            self.config_store.set_premier_map(interaction.guild.id, d, map_name.value)
+
+        pretty_days = ", ".join(d.title() for d in norm_days)
         await interaction.response.send_message(
-            f"Premier map for **{norm_day.title()}** set to **{map_name.value}**.",
+            f"Premier map for **{pretty_days}** set to **{map_name.value}**.",
             ephemeral=True,
         )
 
     @config.command(
         name="map_scrim",
-        description="Set the Scrim map for a given day",
+        description="Set the Scrim map for one or more days",
     )
     @app_commands.describe(
-        day="Day of week (e.g. wednesday)",
-        map_name="Map to scrim on that day",
+        days="Day or comma-separated days (e.g. wednesday, friday)",
+        map_name="Map to scrim on those days",
     )
     @app_commands.choices(
         map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
@@ -1003,16 +1013,16 @@ class ConfigCog(commands.Cog):
     async def config_map_scrim(
         self,
         interaction: discord.Interaction,
-        day: str,
+        days: str,
         map_name: app_commands.Choice[str],
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message("Invalid day(s). Try `wednesday, friday`.", ephemeral=True)
             return
 
         member = interaction.user
@@ -1024,19 +1034,22 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        self.config_store.set_scrim_map(interaction.guild.id, norm_day, map_name.value)
+        for d in norm_days:
+            self.config_store.set_scrim_map(interaction.guild.id, d, map_name.value)
+
+        pretty_days = ", ".join(d.title() for d in norm_days)
         await interaction.response.send_message(
-            f"Scrim map for **{norm_day.title()}** set to **{map_name.value}**.",
+            f"Scrim map for **{pretty_days}** set to **{map_name.value}**.",
             ephemeral=True,
         )
 
     @config.command(
         name="map_practice",
-        description="Set the Practice map for a given day",
+        description="Set the Practice map for one or more days",
     )
     @app_commands.describe(
-        day="Day of week (e.g. wednesday)",
-        map_name="Map to practice on that day",
+        days="Day or comma-separated days (e.g. tuesday, thursday)",
+        map_name="Map to practice on those days",
     )
     @app_commands.choices(
         map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
@@ -1044,16 +1057,16 @@ class ConfigCog(commands.Cog):
     async def config_map_practice(
         self,
         interaction: discord.Interaction,
-        day: str,
+        days: str,
         map_name: app_commands.Choice[str],
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message("Invalid day(s). Try `tuesday, thursday`.", ephemeral=True)
             return
 
         member = interaction.user
@@ -1065,9 +1078,12 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        self.config_store.set_practice_map(interaction.guild.id, norm_day, map_name.value)
+        for d in norm_days:
+            self.config_store.set_practice_map(interaction.guild.id, d, map_name.value)
+
+        pretty_days = ", ".join(d.title() for d in norm_days)
         await interaction.response.send_message(
-            f"Practice map for **{norm_day.title()}** set to **{map_name.value}**.",
+            f"Practice map for **{pretty_days}** set to **{map_name.value}**.",
             ephemeral=True,
         )
 
@@ -1185,13 +1201,15 @@ class AgentsCog(commands.Cog):
                 continue
 
             if target == "ALL":
-                # no filtering by team
-                pass
-            else:
-                stored_team = str(info.get("team") or "") or None
-                effective_team = infer_team(member, stored_team, configured_roles, env_roles_tuple)
-                if effective_team != target:
-                    continue
+                # No team filter, just show everyone with agents
+                name = str(info.get("display_name", member.display_name))
+                bucket[name] = list(agents)
+                continue
+
+            stored_team = str(info.get("team") or "") or None
+            effective_team = infer_team(member, stored_team, configured_roles, env_roles_tuple)
+            if effective_team != target:
+                continue
 
             name = str(info.get("display_name", member.display_name))
             bucket[name] = list(agents)
