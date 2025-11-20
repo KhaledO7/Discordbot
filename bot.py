@@ -14,6 +14,7 @@ from scheduler import ScheduleBuilder
 from storage import (
     AvailabilityStore,
     GuildConfigStore,
+    GameLogStore,
     WEEK_DAYS,
 )
 
@@ -300,7 +301,7 @@ class AgentSelectView(discord.ui.View):
         self.cog = cog
         self.selected_roles: List[str] = []
         self.role_select = AgentRoleSelect(cog)
-        self.agent_select: Optional[AgentSelect] = None  # added later
+        self.agent_select: Optional[AgentSelect] = None  # created on demand
         self.add_item(self.role_select)
 
     def refresh_agent_options(self) -> None:
@@ -354,7 +355,7 @@ class AvailabilityCog(commands.Cog):
             self.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
         )
         normalized_team = infer_team(member, team_override, configured_roles, env_team_roles())
-        normalized_days = sorted({day.lower() for day in days if normalize_day(day)})
+        normalized_days = sorted({normalize_day(day) or day.lower() for day in days if normalize_day(day)})
 
         self.availability_store.set_availability(
             user_id=member.id,
@@ -533,7 +534,7 @@ class ScheduleCog(commands.Cog):
 
     @schedule.command(
         name="pingcheck",
-        description="Check if current numbers would trigger a scrim ping for a given day",
+        description="Check if current numbers would trigger scrim/practice pings for a given day",
     )
     @app_commands.describe(day="Day of week (e.g. friday)")
     async def schedule_pingcheck(self, interaction: discord.Interaction, day: str) -> None:
@@ -556,27 +557,34 @@ class ScheduleCog(commands.Cog):
 
         scrim_time = self.config_store.get_scrim_time(interaction.guild.id, norm_day)
         premier_window = self.config_store.get_premier_window(interaction.guild.id, norm_day)
+        practice_time = self.config_store.get_practice_time(interaction.guild.id, norm_day)
 
         by_team = any(c >= 5 for c in team_counts.values())
         by_total = total >= 10
+        scrim_will_ping = scrim_time is not None and (by_team or by_total)
 
-        will_ping = scrim_time is not None and (by_team or by_total)
+        practice_will_ping = practice_time is not None and total >= 5
 
         desc_lines = [
             f"**Day:** {norm_day.title()}",
             f"**Total available:** {total}",
             f"**Team A:** {team_counts['A']} · **Team B:** {team_counts['B']}",
             f"**Scrim time:** `{scrim_time}`" if scrim_time else "**Scrim time:** OFF",
+            f"**Practice time:** `{practice_time}`" if practice_time else "**Practice time:** OFF",
             f"**Premier window:** `{premier_window}`" if premier_window else "**Premier:** OFF",
             "",
-            "A scrim ping will trigger 30 minutes before the scrim time if:",
+            "Scrim ping (30 minutes before) triggers if:",
             "- At least **10 total** players are available, **or**",
             "- At least **5 players** from **one team** are available.",
             "",
-            f"**Would ping with current numbers?** {'✅ Yes' if will_ping else '❌ No'}",
+            "Practice ping (30 minutes before) triggers if:",
+            "- At least **5 total** players are available.",
+            "",
+            f"**Scrim ping with current numbers?** {'✅ Yes' if scrim_will_ping else '❌ No'}",
+            f"**Practice ping with current numbers?** {'✅ Yes' if practice_will_ping else '❌ No'}",
         ]
 
-        embed = format_embed("Scrim Ping Check", "\n".join(desc_lines))
+        embed = format_embed("Scrim / Practice Ping Check", "\n".join(desc_lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     def _resolve_announcement_channel_id(self, guild: discord.Guild) -> Optional[int]:
@@ -617,7 +625,7 @@ class ConfigCog(commands.Cog):
         )
 
     @config.command(name="pingrole", description="Set the role to ping when posting schedules")
-    @app_commands.describe(role="Role to mention for availability updates and scrim pings")
+    @app_commands.describe(role="Role to mention for availability updates and scrim/practice pings")
     async def config_ping_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
@@ -662,27 +670,31 @@ class ConfigCog(commands.Cog):
             "Saved team roles: " + ", ".join(parts), ephemeral=True
         )
 
+    # ----- Time / window configuration (supports multiple days) -----
+
     @config.command(
         name="scrimtime",
-        description="Set or clear the scrim start time for a given day (HH:MM in 24h, or 'off')",
+        description="Set or clear the scrim start time for one or more days (HH:MM in 24h, or 'off')",
     )
     @app_commands.describe(
-        day="Day of week (e.g. monday)",
-        time_label="24h time like '19:00' for 7 PM, or 'off' to disable scrims that day",
+        days="Day or comma-separated days (e.g. monday, wednesday, friday)",
+        time_label="24h time like '19:00' for 7 PM, or 'off' to disable scrims those days",
     )
     async def config_scrim_time(
         self,
         interaction: discord.Interaction,
-        day: str,
+        days: str,
         time_label: str,
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try monday, tuesday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message(
+                "No valid days provided. Try `monday, wednesday, friday`.", ephemeral=True
+            )
             return
 
         member = interaction.user
@@ -695,9 +707,11 @@ class ConfigCog(commands.Cog):
             return
 
         if time_label.lower() in {"off", "none", "disable"}:
-            self.config_store.set_scrim_time(interaction.guild.id, norm_day, None)
+            for d in norm_days:
+                self.config_store.set_scrim_time(interaction.guild.id, d, None)
+            pretty_days = ", ".join(d.title() for d in norm_days)
             await interaction.response.send_message(
-                f"Scrims for **{norm_day.title()}** turned **OFF**.", ephemeral=True
+                f"Scrims for **{pretty_days}** turned **OFF**.", ephemeral=True
             )
             return
 
@@ -708,9 +722,11 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        self.config_store.set_scrim_time(interaction.guild.id, norm_day, time_label)
+        for d in norm_days:
+            self.config_store.set_scrim_time(interaction.guild.id, d, time_label)
+        pretty_days = ", ".join(d.title() for d in norm_days)
         await interaction.response.send_message(
-            f"Scrim time for **{norm_day.title()}** set to `{time_label}`.", ephemeral=True
+            f"Scrim time for **{pretty_days}** set to `{time_label}`.", ephemeral=True
         )
 
     @config.command(name="check_scrimtimes", description="Show current scrim times for all days")
@@ -749,25 +765,27 @@ class ConfigCog(commands.Cog):
 
     @config.command(
         name="premier_window",
-        description="Set or clear the Premier window for a given day (e.g. '19:00-20:00' or 'off')",
+        description="Set or clear the Premier window for one or more days (e.g. '19:00-20:00' or 'off')",
     )
     @app_commands.describe(
-        day="Day of week (e.g. wednesday)",
-        window="Time window like '19:00-20:00', or 'off' to disable premier that day",
+        days="Day or comma-separated days (e.g. wednesday, thursday)",
+        window="Time window like '19:00-20:00', or 'off' to disable premier those days",
     )
     async def config_premier_window(
         self,
         interaction: discord.Interaction,
-        day: str,
+        days: str,
         window: str,
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        norm_day = normalize_day(day)
-        if not norm_day:
-            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message(
+                "No valid days provided. Try `wednesday, thursday`.", ephemeral=True
+            )
             return
 
         member = interaction.user
@@ -780,9 +798,11 @@ class ConfigCog(commands.Cog):
             return
 
         if window.lower() in {"off", "none", "disable"}:
-            self.config_store.set_premier_window(interaction.guild.id, norm_day, None)
+            for d in norm_days:
+                self.config_store.set_premier_window(interaction.guild.id, d, None)
+            pretty_days = ", ".join(d.title() for d in norm_days)
             await interaction.response.send_message(
-                f"Premier window for **{norm_day.title()}** turned **OFF**.", ephemeral=True
+                f"Premier window for **{pretty_days}** turned **OFF**.", ephemeral=True
             )
             return
 
@@ -793,13 +813,86 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        self.config_store.set_premier_window(interaction.guild.id, norm_day, window)
+        for d in norm_days:
+            self.config_store.set_premier_window(interaction.guild.id, d, window)
+        pretty_days = ", ".join(d.title() for d in norm_days)
         await interaction.response.send_message(
-            f"Premier window for **{norm_day.title()}** set to `{window}`.", ephemeral=True
+            f"Premier window for **{pretty_days}** set to `{window}`.", ephemeral=True
         )
 
-    @config.command(name="reset_premier", description="Reset all Premier windows to defaults")
-    async def config_reset_premier(self, interaction: discord.Interaction) -> None:
+    @config.command(
+        name="practicetime",
+        description="Set or clear the practice time for one or more days (HH:MM in 24h, or 'off')",
+    )
+    @app_commands.describe(
+        days="Day or comma-separated days (e.g. monday, wednesday, friday)",
+        time_label="24h time like '18:00', or 'off' to disable practice those days",
+    )
+    async def config_practice_time(
+        self,
+        interaction: discord.Interaction,
+        days: str,
+        time_label: str,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message(
+                "No valid days provided. Try `monday, wednesday, friday`.", ephemeral=True
+            )
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change practice times.", ephemeral=True
+            )
+            return
+
+        if time_label.lower() in {"off", "none", "disable"}:
+            for d in norm_days:
+                self.config_store.set_practice_time(interaction.guild.id, d, None)
+            pretty_days = ", ".join(d.title() for d in norm_days)
+            await interaction.response.send_message(
+                f"Practice for **{pretty_days}** turned **OFF**.", ephemeral=True
+            )
+            return
+
+        t = _parse_hhmm_to_time(time_label)
+        if t is None:
+            await interaction.response.send_message(
+                "Invalid time format. Use 24h `HH:MM`, e.g. `18:00`.", ephemeral=True
+            )
+            return
+
+        for d in norm_days:
+            self.config_store.set_practice_time(interaction.guild.id, d, time_label)
+        pretty_days = ", ".join(d.title() for d in norm_days)
+        await interaction.response.send_message(
+            f"Practice time for **{pretty_days}** set to `{time_label}`.", ephemeral=True
+        )
+
+    @config.command(name="check_practice", description="Show current practice times for all days")
+    async def config_check_practice(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        lines: List[str] = []
+        for d in WEEK_DAYS:
+            t = self.config_store.get_practice_time(interaction.guild.id, d)
+            label = t if t is not None else "OFF"
+            lines.append(f"**{d.title()}**: `{label}`")
+        embed = format_embed("Current Practice Times", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @config.command(name="reset_practice", description="Reset all practice times to defaults (OFF)")
+    async def config_reset_practice(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
@@ -809,16 +902,16 @@ class ConfigCog(commands.Cog):
             member.guild_permissions.manage_guild or member.guild_permissions.administrator
         ):
             await interaction.response.send_message(
-                "You need Manage Server permission to reset premier windows.", ephemeral=True
+                "You need Manage Server permission to reset practice times.", ephemeral=True
             )
             return
 
-        self.config_store.reset_premier_windows(interaction.guild.id)
+        self.config_store.reset_practice_times(interaction.guild.id)
         await interaction.response.send_message(
-            "All premier windows reset to default.", ephemeral=True
+            "All practice times reset to default (OFF).", ephemeral=True
         )
 
-    @config.command(name="reset_schedule", description="Reset scrim times and premier windows to defaults")
+    @config.command(name="reset_schedule", description="Reset scrim, premier, and practice times to defaults")
     async def config_reset_schedule(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
@@ -835,7 +928,7 @@ class ConfigCog(commands.Cog):
 
         self.config_store.reset_entire_schedule(interaction.guild.id)
         await interaction.response.send_message(
-            "Entire schedule (scrim times + premier windows) reset to defaults.", ephemeral=True
+            "Entire schedule (scrim, premier, practice) reset to defaults.", ephemeral=True
         )
 
     @config.command(name="check_premier", description="Show current Premier windows for all days")
@@ -853,6 +946,7 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ----- Map configuration -----
+
 
     @config.command(
         name="map_premier",
@@ -936,7 +1030,48 @@ class ConfigCog(commands.Cog):
             ephemeral=True,
         )
 
-    @config.command(name="check_maps", description="Show current Premier/Scrim maps for all days")
+    @config.command(
+        name="map_practice",
+        description="Set the Practice map for a given day",
+    )
+    @app_commands.describe(
+        day="Day of week (e.g. wednesday)",
+        map_name="Map to practice on that day",
+    )
+    @app_commands.choices(
+        map_name=[app_commands.Choice(name=m, value=m) for m in VALORANT_MAPS]
+    )
+    async def config_map_practice(
+        self,
+        interaction: discord.Interaction,
+        day: str,
+        map_name: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        norm_day = normalize_day(day)
+        if not norm_day:
+            await interaction.response.send_message("Invalid day. Try wednesday, thursday, etc.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set maps.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_practice_map(interaction.guild.id, norm_day, map_name.value)
+        await interaction.response.send_message(
+            f"Practice map for **{norm_day.title()}** set to **{map_name.value}**.",
+            ephemeral=True,
+        )
+
+    @config.command(name="check_maps", description="Show current Premier/Scrim/Practice maps for all days")
     async def config_check_maps(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
@@ -946,9 +1081,13 @@ class ConfigCog(commands.Cog):
         for d in WEEK_DAYS:
             p = self.config_store.get_premier_map(interaction.guild.id, d)
             s = self.config_store.get_scrim_map(interaction.guild.id, d)
+            pr = self.config_store.get_practice_map(interaction.guild.id, d)
             p_label = p if p is not None else "—"
             s_label = s if s is not None else "—"
-            lines.append(f"**{d.title()}** · Premier: `{p_label}` · Scrim: `{s_label}`")
+            pr_label = pr if pr is not None else "—"
+            lines.append(
+                f"**{d.title()}** · Premier: `{p_label}` · Scrim: `{s_label}` · Practice: `{pr_label}`"
+            )
 
         embed = format_embed("Current Maps", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1033,14 +1172,28 @@ class AgentsCog(commands.Cog):
         users = self.availability_store.all_users()
         bucket: Dict[str, List[str]] = {}
 
+        configured_roles = self.config_store.get_team_roles(interaction.guild.id)
+        env_roles_tuple = env_team_roles()
+
         for user_id, info in users.items():
-            user_team = (str(info.get("team") or "")).upper()
-            if target != "ALL" and user_team != target:
+            member = interaction.guild.get_member(int(user_id))
+            if member is None:
                 continue
+
             agents = info.get("agents") or []
             if not agents:
                 continue
-            name = str(info.get("display_name", f"User {user_id}"))
+
+            if target == "ALL":
+                # no filtering by team
+                pass
+            else:
+                stored_team = str(info.get("team") or "") or None
+                effective_team = infer_team(member, stored_team, configured_roles, env_roles_tuple)
+                if effective_team != target:
+                    continue
+
+            name = str(info.get("display_name", member.display_name))
             bucket[name] = list(agents)
 
         if not bucket:
@@ -1051,8 +1204,8 @@ class AgentsCog(commands.Cog):
             return
 
         lines: List[str] = []
-        for name, agents in bucket.items():
-            lines.append(f"**{name}**: {', '.join(agents)}")
+        for name, agents_list in bucket.items():
+            lines.append(f"**{name}**: {', '.join(agents_list)}")
 
         label = "all teams" if target == "ALL" else f"Team {target}"
         embed = format_embed(f"Agents for {label}", "\n".join(lines))
@@ -1061,7 +1214,7 @@ class AgentsCog(commands.Cog):
 
 class RoleSyncCog(commands.Cog):
     """Keeps the 'available' role in sync with today's availability
-    and handles weekly reset and scrim pre-pings.
+    and handles weekly reset and scrim/practice pre-pings.
     """
 
     def __init__(
@@ -1075,6 +1228,8 @@ class RoleSyncCog(commands.Cog):
         self.config_store = config_store
         self._target_weekday_index: int = self._resolve_reset_weekday()
         self._last_reset_date: Optional[date] = None
+        self._scrim_ping_sent: Dict[int, date] = {}
+        self._practice_ping_sent: Dict[int, date] = {}
         self.role_sync_task.start()
         self.scrim_ping_task.start()
 
@@ -1149,7 +1304,7 @@ class RoleSyncCog(commands.Cog):
     async def before_role_sync(self) -> None:
         await self.bot.wait_until_ready()
 
-    # ---- Scrim pre-ping logic ----
+    # ---- Scrim / practice pre-ping logic ----
 
     async def _maybe_ping_scrim_for_guild(self, guild: discord.Guild) -> None:
         today_label = self._resolve_today_label()
@@ -1157,12 +1312,15 @@ class RoleSyncCog(commands.Cog):
         if scrim_time_label is None:
             return
 
-        scrim_time = _parse_hhmm_to_time(scrim_time_label)
-        if scrim_time is None:
+        scrim_time_obj = _parse_hhmm_to_time(scrim_time_label)
+        if scrim_time_obj is None:
             return
 
         now = datetime.now()
-        target_dt = datetime.combine(now.date(), scrim_time)
+        if self._scrim_ping_sent.get(guild.id) == now.date():
+            return  # already pinged today
+
+        target_dt = datetime.combine(now.date(), scrim_time_obj)
         delta = target_dt - now
 
         if not (timedelta(minutes=25) <= delta <= timedelta(minutes=35)):
@@ -1206,18 +1364,276 @@ class RoleSyncCog(commands.Cog):
                 f"({total} players signed, Team A: {team_counts['A']}, Team B: {team_counts['B']}). "
                 f"This is your 30-minute reminder."
             )
+            self._scrim_ping_sent[guild.id] = now.date()
         except discord.HTTPException:
             logging.warning("Failed to send scrim reminder in %s", guild.name)
 
+    async def _maybe_ping_practice_for_guild(self, guild: discord.Guild) -> None:
+        today_label = self._resolve_today_label()
+        practice_time_label = self.config_store.get_practice_time(guild.id, today_label)
+        if practice_time_label is None:
+            return
+
+        practice_time_obj = _parse_hhmm_to_time(practice_time_label)
+        if practice_time_obj is None:
+            return
+
+        now = datetime.now()
+        if self._practice_ping_sent.get(guild.id) == now.date():
+            return  # already pinged today
+
+        target_dt = datetime.combine(now.date(), practice_time_obj)
+        delta = target_dt - now
+
+        if not (timedelta(minutes=25) <= delta <= timedelta(minutes=35)):
+            return
+
+        users = self.availability_store.users_for_day(today_label)
+        total = len(users)
+        if total < 5:
+            return
+
+        team_counts: Dict[str, int] = {"A": 0, "B": 0}
+        for info in users:
+            t = str(info.get("team") or "").upper()
+            if t in team_counts:
+                team_counts[t] += 1
+
+        channel_id = self.config_store.get_announcement_channel(guild.id) or ANNOUNCEMENT_CHANNEL_ID_ENV
+        if not channel_id:
+            return
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            return
+
+        role_id = self._resolve_ping_role_id(guild)
+        mention = ""
+        if role_id:
+            role = guild.get_role(role_id)
+            if role:
+                mention = role.mention + " "
+
+        try:
+            await channel.send(
+                f"{mention}Practice is **today** at `{practice_time_label}` "
+                f"({total} players signed, Team A: {team_counts['A']}, Team B: {team_counts['B']}). "
+                f"This is your 30-minute reminder."
+            )
+            self._practice_ping_sent[guild.id] = now.date()
+        except discord.HTTPException:
+            logging.warning("Failed to send practice reminder in %s", guild.name)
+
     @tasks.loop(minutes=5)
     async def scrim_ping_task(self) -> None:
-        """Check frequently if we are ~30 minutes before today's scrim and ping if ready."""
+        """Check frequently if we are ~30 minutes before today's scrim/practice and ping if ready."""
         for guild in self.bot.guilds:
             await self._maybe_ping_scrim_for_guild(guild)
+            await self._maybe_ping_practice_for_guild(guild)
 
     @scrim_ping_task.before_loop
     async def before_scrim_ping(self) -> None:
         await self.bot.wait_until_ready()
+
+
+class GameLogCog(commands.Cog):
+    """Log and review scrims/premier/practice days."""
+
+    def __init__(self, bot: commands.Bot, log_store: GameLogStore) -> None:
+        self.bot = bot
+        self.log_store = log_store
+
+    log = app_commands.Group(name="log", description="Log scrims, premier, and practice matches")
+    check = app_commands.Group(name="check", description="Check logged matches")
+
+    # ---- Logging ----
+
+    @log.command(name="day", description="Log a scrim/premier/practice match for a specific date")
+    @app_commands.describe(
+        date_str="Date in YYYY-MM-DD (e.g. 2025-11-20)",
+        match_type="Type of match",
+        time_label="Start time in 24h HH:MM (server time)",
+        agents="Agents played (comma-separated)",
+        result="Result and/or score (e.g. 'W 13-11', 'L 11-13')",
+        vod_url="Optional VOD / video link",
+        comments="Optional comments/notes",
+    )
+    @app_commands.choices(
+        match_type=[
+            app_commands.Choice(name="Premier", value="premier"),
+            app_commands.Choice(name="Scrim", value="scrim"),
+            app_commands.Choice(name="Practice", value="practice"),
+        ]
+    )
+    async def log_day(
+        self,
+        interaction: discord.Interaction,
+        date_str: str,
+        match_type: app_commands.Choice[str],
+        time_label: str,
+        agents: str,
+        result: str,
+        vod_url: Optional[str] = None,
+        comments: Optional[str] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        # Validate date
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid date format. Use `YYYY-MM-DD`, e.g. `2025-11-20`.", ephemeral=True
+            )
+            return
+
+        # Validate time
+        if _parse_hhmm_to_time(time_label) is None:
+            await interaction.response.send_message(
+                "Invalid time format. Use 24h `HH:MM`, e.g. `19:00`.", ephemeral=True
+            )
+            return
+
+        agents_list = [a.strip() for a in agents.split(",") if a.strip()]
+        entry = {
+            "date": date_str,
+            "type": match_type.value,
+            "time": time_label,
+            "agents": agents_list,
+            "result": result,
+            "vod_url": vod_url,
+            "comments": comments,
+            "logged_by_id": interaction.user.id,
+            "logged_by_name": getattr(interaction.user, "display_name", str(interaction.user)),
+            "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+
+        log_id = self.log_store.add_log(interaction.guild.id, entry)
+
+        lines = [
+            f"**Log ID:** {log_id}",
+            f"**Date:** {date_str}",
+            f"**Type:** {match_type.name}",
+            f"**Time:** `{time_label}`",
+            f"**Agents:** {', '.join(agents_list) if agents_list else '—'}",
+            f"**Result:** {result}",
+        ]
+        if vod_url:
+            lines.append(f"**VOD:** {vod_url}")
+        if comments:
+            lines.append(f"**Comments:** {comments}")
+
+        embed = format_embed("Match logged ✅", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @log.command(name="clear_date", description="Admin: clear all logs for a specific date")
+    @app_commands.describe(date_str="Date in YYYY-MM-DD (e.g. 2025-11-20)")
+    async def log_clear_date(self, interaction: discord.Interaction, date_str: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to clear logs.", ephemeral=True
+            )
+            return
+
+        removed = self.log_store.clear_logs_for_date(interaction.guild.id, date_str)
+        await interaction.response.send_message(
+            f"Removed **{removed}** logs for `{date_str}`.", ephemeral=True
+        )
+
+    @log.command(name="clear_all", description="Admin: clear ALL logs for this server")
+    async def log_clear_all(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to clear logs.", ephemeral=True
+            )
+            return
+
+        removed = self.log_store.clear_all_logs(interaction.guild.id)
+        await interaction.response.send_message(
+            f"Removed **{removed}** logged matches for this server.", ephemeral=True
+        )
+
+    # ---- Checking ----
+
+    @check.command(name="day", description="Show all logged matches for a specific date")
+    @app_commands.describe(date_str="Date in YYYY-MM-DD (e.g. 2025-11-20)")
+    async def check_day(self, interaction: discord.Interaction, date_str: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        logs = self.log_store.logs_for_date(interaction.guild.id, date_str)
+        if not logs:
+            await interaction.response.send_message(
+                f"No matches logged for `{date_str}`.", ephemeral=True
+            )
+            return
+
+        lines: List[str] = []
+        for log in logs:
+            lid = log.get("id")
+            mtype = str(log.get("type", "unknown")).title()
+            time_label = log.get("time", "—")
+            agents_list = ", ".join(log.get("agents", [])) or "—"
+            result = log.get("result", "—")
+            vod = log.get("vod_url")
+            comments = log.get("comments")
+
+            lines.append(f"**#{lid}** — {mtype} at `{time_label}` · Result: **{result}**")
+            lines.append(f"• Agents: {agents_list}")
+            if vod:
+                lines.append(f"• VOD: {vod}")
+            if comments:
+                lines.append(f"• Notes: {comments}")
+            lines.append("")  # blank line between logs
+
+        description = "\n".join(lines[:600])  # basic safety against over-long output
+        embed = format_embed(f"Logged matches for {date_str}", description)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @check.command(name="recent", description="Show the most recent logged matches")
+    @app_commands.describe(limit="How many recent matches to show (default 5, max 20)")
+    async def check_recent(self, interaction: discord.Interaction, limit: Optional[int] = 5) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        if limit is None:
+            limit = 5
+        limit = max(1, min(20, limit))
+
+        logs = self.log_store.recent_logs(interaction.guild.id, limit=limit)
+        if not logs:
+            await interaction.response.send_message("No matches logged yet.", ephemeral=True)
+            return
+
+        lines: List[str] = []
+        for log in logs:
+            lid = log.get("id")
+            date_str = log.get("date", "—")
+            mtype = str(log.get("type", "unknown")).title()
+            time_label = log.get("time", "—")
+            result = log.get("result", "—")
+            lines.append(f"**#{lid}** — {date_str} · {mtype} at `{time_label}` · Result: **{result}**")
+
+        embed = format_embed("Recent logged matches", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class ValorantBot(commands.Bot):
@@ -1229,6 +1645,7 @@ class ValorantBot(commands.Bot):
 
         self.availability_store = AvailabilityStore()
         self.config_store = GuildConfigStore()
+        self.log_store = GameLogStore()
 
     async def setup_hook(self) -> None:  # type: ignore[override]
         await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
@@ -1236,6 +1653,7 @@ class ValorantBot(commands.Bot):
         await self.add_cog(ConfigCog(self, self.config_store))
         await self.add_cog(AgentsCog(self, self.availability_store, self.config_store))
         await self.add_cog(RoleSyncCog(self, self.availability_store, self.config_store))
+        await self.add_cog(GameLogCog(self, self.log_store))
 
         try:
             synced = await self.tree.sync()
