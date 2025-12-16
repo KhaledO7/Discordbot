@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import traceback
 from datetime import datetime, date, time, timedelta
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 
 import discord
 from discord import app_commands
@@ -144,8 +146,38 @@ def infer_team(
     return None
 
 
-def format_embed(title: str, description: str) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=discord.Color.brand_red())
+def format_embed(title: str, description: str, color: discord.Color = None) -> discord.Embed:
+    """Create a standardized embed with consistent styling."""
+    if color is None:
+        color = discord.Color.brand_red()
+    return discord.Embed(title=title, description=description, color=color)
+
+
+def error_embed(title: str, description: str) -> discord.Embed:
+    """Create an error-styled embed."""
+    return discord.Embed(title=f"Error: {title}", description=description, color=discord.Color.red())
+
+
+def success_embed(title: str, description: str) -> discord.Embed:
+    """Create a success-styled embed."""
+    return discord.Embed(title=title, description=description, color=discord.Color.green())
+
+
+async def safe_respond(
+    interaction: discord.Interaction,
+    content: str = None,
+    embed: discord.Embed = None,
+    view: discord.ui.View = None,
+    ephemeral: bool = True,
+) -> None:
+    """Safely respond to an interaction, handling already-responded cases."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        logging.error("Failed to respond to interaction: %s", e)
 
 
 def _parse_hhmm_to_time(label: str) -> Optional[time]:
@@ -165,12 +197,31 @@ def _parse_hhmm_to_time(label: str) -> Optional[time]:
 
 # -------------------------- Availability UI --------------------------
 
+# Day emoji mapping for better visual presentation
+DAY_EMOJIS = {
+    "monday": "1️⃣",
+    "tuesday": "2️⃣",
+    "wednesday": "3️⃣",
+    "thursday": "4️⃣",
+    "friday": "5️⃣",
+    "saturday": "6️⃣",
+    "sunday": "7️⃣",
+}
+
 
 class AvailabilitySelect(discord.ui.Select):
     def __init__(self, cog: "AvailabilityCog") -> None:
-        options = [discord.SelectOption(label=day.title(), value=day) for day in WEEK_DAYS]
+        options = [
+            discord.SelectOption(
+                label=day.title(),
+                value=day,
+                emoji=DAY_EMOJIS.get(day, None),
+                description=f"Available on {day.title()}"
+            )
+            for day in WEEK_DAYS
+        ]
         super().__init__(
-            placeholder="Pick the days you can play",
+            placeholder="Select days you can play (multi-select)",
             min_values=1,
             max_values=len(options),
             options=options,
@@ -185,15 +236,19 @@ class AvailabilitySelect(discord.ui.Select):
 
         saved_days, team = await self.cog._save_availability(member, list(self.values), None)
         pretty_days = ", ".join(day.title() for day in saved_days)
-        await interaction.response.send_message(
-            f"Saved availability for **{member.display_name}**: {pretty_days} | Team: {team or 'Not set'}",
-            ephemeral=True,
+
+        embed = success_embed(
+            "Availability Saved",
+            f"**Player:** {member.display_name}\n"
+            f"**Days:** {pretty_days}\n"
+            f"**Team:** {team or 'Not assigned'}"
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class AvailabilityClearButton(discord.ui.Button):
     def __init__(self, cog: "AvailabilityCog") -> None:
-        super().__init__(style=discord.ButtonStyle.secondary, label="Clear my week")
+        super().__init__(style=discord.ButtonStyle.danger, label="Clear My Week", emoji="🗑️")
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -203,14 +258,85 @@ class AvailabilityClearButton(discord.ui.Button):
             return
 
         self.cog.availability_store.clear_user(member.id)
-        await interaction.response.send_message("Cleared your availability for the week.", ephemeral=True)
+        embed = success_embed("Availability Cleared", "Your availability for this week has been reset.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AvailabilityAllWeekButton(discord.ui.Button):
+    """Quick button to mark available for all days."""
+    def __init__(self, cog: "AvailabilityCog") -> None:
+        super().__init__(style=discord.ButtonStyle.success, label="Available All Week", emoji="✅")
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        saved_days, team = await self.cog._save_availability(member, list(WEEK_DAYS), None)
+        embed = success_embed(
+            "Availability Saved",
+            f"**Player:** {member.display_name}\n"
+            f"**Days:** All week (Mon-Sun)\n"
+            f"**Team:** {team or 'Not assigned'}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class AvailabilityViewMineButton(discord.ui.Button):
+    """Button to view current availability."""
+    def __init__(self, cog: "AvailabilityCog") -> None:
+        super().__init__(style=discord.ButtonStyle.secondary, label="View My Status", emoji="👤")
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        days = self.cog.availability_store.get_user_days(member.id)
+        user_info = self.cog.availability_store.get_user_info(member.id)
+
+        if not days:
+            embed = format_embed("Your Status", "No availability saved yet. Use the dropdown above to sign up!")
+        else:
+            pretty_days = ", ".join(day.title() for day in days)
+            roles = user_info.get("roles", [])
+            agents = user_info.get("agents", [])
+            tz = user_info.get("timezone", "Not set")
+
+            embed = format_embed(
+                f"Status: {member.display_name}",
+                f"**Available:** {pretty_days}\n"
+                f"**Team:** {user_info.get('team') or 'Not assigned'}\n"
+                f"**Roles:** {', '.join(r.title() for r in roles) if roles else 'Not set'}\n"
+                f"**Agents:** {', '.join(agents) if agents else 'Not set'}\n"
+                f"**Timezone:** {tz}"
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class AvailabilityPanelView(discord.ui.View):
     def __init__(self, cog: "AvailabilityCog") -> None:
-        super().__init__(timeout=60 * 60)
+        super().__init__(timeout=60 * 60)  # 1 hour timeout
         self.add_item(AvailabilitySelect(cog))
+        self.add_item(AvailabilityAllWeekButton(cog))
+        self.add_item(AvailabilityViewMineButton(cog))
         self.add_item(AvailabilityClearButton(cog))
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        """Disable all components when the view times out."""
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
 # -------------------------- Agents UI --------------------------
@@ -297,12 +423,24 @@ class AgentSelect(discord.ui.Select):
 
 class AgentSelectView(discord.ui.View):
     def __init__(self, cog: "AgentsCog") -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=300)  # 5 minute timeout
         self.cog = cog
         self.selected_roles: List[str] = []
         self.role_select = AgentRoleSelect(cog)
         self.agent_select: Optional[AgentSelect] = None  # created on demand
         self.add_item(self.role_select)
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        """Disable all components when the view times out."""
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     def refresh_agent_options(self) -> None:
         agents: List[str] = []
@@ -449,6 +587,9 @@ class AvailabilityCog(commands.Cog):
             await interaction.response.send_message("Run this in a server channel.", ephemeral=True)
             return
 
+        # Defer first to avoid "Interaction failed" - channel.send may take time
+        await interaction.response.defer(ephemeral=True)
+
         embed = format_embed(
             "Weekly Signup Panel",
             (
@@ -457,8 +598,9 @@ class AvailabilityCog(commands.Cog):
             ),
         )
         view = AvailabilityPanelView(self)
-        await interaction.channel.send(embed=embed, view=view)
-        await interaction.response.send_message("Signup panel posted!", ephemeral=True)
+        msg = await interaction.channel.send(embed=embed, view=view)
+        view.message = msg  # Store reference for timeout cleanup
+        await interaction.followup.send("Signup panel posted!", ephemeral=True)
 
     @availability.command(
         name="resetweek", description="Admins: clear all saved availability for a fresh week"
@@ -512,10 +654,6 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
-        summaries = self.schedule_builder.build_week(interaction.guild.id)
-        text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
-        embed = format_embed("Valorant Weekly Schedule", text)
-
         channel_id = self._resolve_announcement_channel_id(interaction.guild)
         if not channel_id:
             await interaction.response.send_message(
@@ -529,10 +667,17 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Announcement channel not found.", ephemeral=True)
             return
 
+        # Defer first to avoid "Interaction failed" - channel.send may take time
+        await interaction.response.defer(ephemeral=True)
+
+        summaries = self.schedule_builder.build_week(interaction.guild.id)
+        text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
+        embed = format_embed("Valorant Weekly Schedule", text)
+
         mention = self._resolve_ping_mention(interaction.guild)
         content = f"{mention} Weekly schedule updated!" if mention else "Weekly schedule updated!"
         await channel.send(content=content, embed=embed)
-        await interaction.response.send_message("Schedule posted!", ephemeral=True)
+        await interaction.followup.send("Schedule posted!", ephemeral=True)
 
     @schedule.command(
         name="pingcheck",
@@ -1654,6 +1799,453 @@ class GameLogCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# Common timezones for the dropdown
+COMMON_TIMEZONES = [
+    ("US/Eastern", "Eastern Time (ET)"),
+    ("US/Central", "Central Time (CT)"),
+    ("US/Mountain", "Mountain Time (MT)"),
+    ("US/Pacific", "Pacific Time (PT)"),
+    ("Europe/London", "London (GMT/BST)"),
+    ("Europe/Paris", "Central European (CET)"),
+    ("Europe/Berlin", "Berlin (CET)"),
+    ("Asia/Tokyo", "Tokyo (JST)"),
+    ("Asia/Seoul", "Seoul (KST)"),
+    ("Australia/Sydney", "Sydney (AEST)"),
+    ("America/Sao_Paulo", "Sao Paulo (BRT)"),
+    ("UTC", "UTC"),
+]
+
+
+class ProfileCog(commands.Cog):
+    """Manage player profile settings including timezone."""
+
+    def __init__(self, bot: commands.Bot, availability_store: AvailabilityStore) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+
+    profile = app_commands.Group(name="profile", description="Manage your player profile")
+
+    @profile.command(name="timezone", description="Set your timezone for schedule display")
+    @app_commands.describe(timezone="Your timezone")
+    @app_commands.choices(
+        timezone=[
+            app_commands.Choice(name=label, value=tz) for tz, label in COMMON_TIMEZONES
+        ]
+    )
+    async def profile_timezone(
+        self, interaction: discord.Interaction, timezone: app_commands.Choice[str]
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        self.availability_store.set_user_timezone(member.id, timezone.value)
+        embed = success_embed(
+            "Timezone Updated",
+            f"Your timezone is now set to **{timezone.name}** (`{timezone.value}`).\n"
+            "Schedule times will be shown in your local time when possible."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @profile.command(name="view", description="View your full profile")
+    async def profile_view(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        info = self.availability_store.get_user_info(member.id)
+        days = info.get("days", [])
+        roles = info.get("roles", [])
+        agents = info.get("agents", [])
+        tz = info.get("timezone")
+
+        lines = [
+            f"**Player:** {member.display_name}",
+            f"**Team:** {info.get('team') or 'Not assigned'}",
+            f"**Available Days:** {', '.join(d.title() for d in days) if days else 'None set'}",
+            f"**Roles:** {', '.join(r.title() for r in roles) if roles else 'Not set'}",
+            f"**Agents:** {', '.join(agents) if agents else 'Not set'}",
+            f"**Timezone:** {tz or 'Not set (use /profile timezone)'}",
+        ]
+
+        embed = format_embed(f"Profile: {member.display_name}", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class LineupCog(commands.Cog):
+    """Manage lineup locks and suggestions."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self.schedule_builder = ScheduleBuilder(availability_store, config_store)
+
+    lineup = app_commands.Group(name="lineup", description="Manage match lineups")
+
+    @lineup.command(name="suggest", description="Get a suggested lineup for a day based on roles")
+    @app_commands.describe(day="Day to get lineup suggestion for")
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def lineup_suggest(
+        self, interaction: discord.Interaction, day: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        # Build with lineup suggestions enabled
+        summaries = self.schedule_builder.build_week(interaction.guild.id, include_lineup_suggestions=True)
+
+        # Find the day
+        day_summary = next((s for s in summaries if s.day == day.value), None)
+        if not day_summary:
+            await interaction.response.send_message("Day not found.", ephemeral=True)
+            return
+
+        if day_summary.total_available < 5:
+            embed = error_embed(
+                "Not Enough Players",
+                f"Only **{day_summary.total_available}** players available on {day.name}.\n"
+                f"Need at least 5 for a lineup suggestion."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        suggestion = day_summary.lineup_suggestion
+        if not suggestion:
+            embed = error_embed("No Suggestion", "Could not generate a lineup suggestion.")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Format the suggestion
+        player_lines = []
+        for p in suggestion.players:
+            role_str = f" ({', '.join(r.title() for r in p.roles)})" if p.roles else ""
+            player_lines.append(f"• **{p.display_name}**{role_str}")
+
+        status = "Complete" if suggestion.is_complete else "Incomplete"
+        role_status = "All roles covered" if suggestion.has_all_roles else f"Missing: {', '.join(r.title() for r in suggestion.missing_roles)}"
+
+        embed = format_embed(
+            f"Lineup Suggestion: {day.name}",
+            f"**Status:** {status} ({len(suggestion.players)}/5 players)\n"
+            f"**Roles:** {role_status}\n\n"
+            f"**Suggested Players:**\n" + "\n".join(player_lines),
+            color=discord.Color.green() if suggestion.is_complete and suggestion.has_all_roles else discord.Color.orange()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @lineup.command(name="lock", description="Lock the lineup for a specific day (admin only)")
+    @app_commands.describe(
+        day="Day to lock lineup for",
+        players="Mention up to 5 players to lock in the lineup"
+    )
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def lineup_lock(
+        self,
+        interaction: discord.Interaction,
+        day: app_commands.Choice[str],
+        players: str,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to lock lineups.", ephemeral=True
+            )
+            return
+
+        # Parse player mentions from the string
+        import re
+        mention_pattern = r"<@!?(\d+)>"
+        matches = re.findall(mention_pattern, players)
+
+        if not matches:
+            embed = error_embed(
+                "No Players Found",
+                "Please mention players using @username. Example:\n"
+                "`/lineup lock day:Wednesday players:@player1 @player2 @player3 @player4 @player5`"
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        player_ids = [int(m) for m in matches[:5]]  # Max 5 players
+
+        if len(player_ids) != 5:
+            embed = error_embed(
+                "Invalid Lineup",
+                f"Found {len(player_ids)} player(s). A lineup must have exactly 5 players."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Lock the lineup
+        self.config_store.set_locked_lineup(interaction.guild.id, day.value, player_ids, "premier")
+
+        # Get player names
+        player_names = []
+        for pid in player_ids:
+            m = interaction.guild.get_member(pid)
+            player_names.append(m.display_name if m else f"Unknown ({pid})")
+
+        embed = success_embed(
+            f"Lineup Locked: {day.name}",
+            f"**Players:**\n" + "\n".join(f"• {name}" for name in player_names)
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @lineup.command(name="view", description="View the locked lineup for a day")
+    @app_commands.describe(day="Day to view lineup for")
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def lineup_view(
+        self, interaction: discord.Interaction, day: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        locked = self.config_store.get_locked_lineup(interaction.guild.id, day.value, "premier")
+
+        if not locked:
+            embed = format_embed(
+                f"Lineup: {day.name}",
+                "No lineup locked for this day yet.\n"
+                "Use `/lineup lock` to set one, or `/lineup suggest` for a recommendation."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        player_ids = locked.get("player_ids", [])
+        locked_at = locked.get("locked_at", "Unknown")
+
+        player_lines = []
+        for pid in player_ids:
+            m = interaction.guild.get_member(int(pid))
+            if m:
+                info = self.availability_store.get_user_info(m.id)
+                roles = info.get("roles", [])
+                role_str = f" - {', '.join(r.title() for r in roles)}" if roles else ""
+                player_lines.append(f"• **{m.display_name}**{role_str}")
+            else:
+                player_lines.append(f"• Unknown player ({pid})")
+
+        embed = format_embed(
+            f"Locked Lineup: {day.name}",
+            f"**Locked at:** {locked_at}\n\n"
+            f"**Players:**\n" + "\n".join(player_lines),
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @lineup.command(name="unlock", description="Unlock/clear the lineup for a day (admin only)")
+    @app_commands.describe(day="Day to unlock lineup for")
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def lineup_unlock(
+        self, interaction: discord.Interaction, day: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to unlock lineups.", ephemeral=True
+            )
+            return
+
+        cleared = self.config_store.clear_locked_lineup(interaction.guild.id, day.value, "premier")
+        if cleared:
+            embed = success_embed("Lineup Unlocked", f"The lineup for **{day.name}** has been cleared.")
+        else:
+            embed = format_embed("No Lineup", f"There was no locked lineup for **{day.name}**.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class PremierCog(commands.Cog):
+    """Admin commands for Premier bot management."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+        log_store: GameLogStore,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self.log_store = log_store
+
+    premier = app_commands.Group(name="premier", description="Premier bot admin commands")
+
+    @premier.command(name="status", description="Show bot status and configuration summary (admin only)")
+    async def premier_status(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to view bot status.", ephemeral=True
+            )
+            return
+
+        guild_id = interaction.guild.id
+
+        # Get configuration summary
+        ann_channel = self.config_store.get_announcement_channel(guild_id)
+        ping_role = self.config_store.get_ping_role(guild_id)
+        team_roles = self.config_store.get_team_roles(guild_id)
+        reminders_enabled = self.config_store.get_reminders_enabled(guild_id)
+
+        # Count availability
+        all_users = self.availability_store.all_users()
+        users_with_days = sum(1 for u in all_users.values() if u.get("days"))
+        users_with_agents = sum(1 for u in all_users.values() if u.get("agents"))
+
+        # Count logs
+        recent_logs = self.log_store.recent_logs(guild_id, limit=100)
+
+        # Get today's schedule
+        today_idx = datetime.now().weekday()
+        today_label = WEEK_DAYS[today_idx]
+        today_users = self.availability_store.users_for_day(today_label)
+
+        # Build status
+        ann_str = f"<#{ann_channel}>" if ann_channel else "Not set"
+        ping_str = f"<@&{ping_role}>" if ping_role else "Not set"
+        team_a_str = f"<@&{team_roles['A']}>" if team_roles.get("A") else "Not set"
+        team_b_str = f"<@&{team_roles['B']}>" if team_roles.get("B") else "Not set"
+
+        lines = [
+            "## Configuration",
+            f"**Announcement Channel:** {ann_str}",
+            f"**Ping Role:** {ping_str}",
+            f"**Team A Role:** {team_a_str}",
+            f"**Team B Role:** {team_b_str}",
+            f"**Reminders:** {'Enabled' if reminders_enabled else 'Disabled'}",
+            "",
+            "## Statistics",
+            f"**Players with availability:** {users_with_days}",
+            f"**Players with agents set:** {users_with_agents}",
+            f"**Logged matches:** {len(recent_logs)}",
+            "",
+            "## Today ({})".format(today_label.title()),
+            f"**Available players:** {len(today_users)}",
+        ]
+
+        embed = format_embed(f"Premier Bot Status — {interaction.guild.name}", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @premier.command(name="reminders", description="Enable or disable automatic match reminders")
+    @app_commands.describe(enabled="Enable or disable reminders")
+    @app_commands.choices(
+        enabled=[
+            app_commands.Choice(name="Enable", value="true"),
+            app_commands.Choice(name="Disable", value="false"),
+        ]
+    )
+    async def premier_reminders(
+        self, interaction: discord.Interaction, enabled: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change reminder settings.", ephemeral=True
+            )
+            return
+
+        is_enabled = enabled.value == "true"
+        self.config_store.set_reminders_enabled(interaction.guild.id, is_enabled)
+
+        status = "enabled" if is_enabled else "disabled"
+        embed = success_embed(
+            "Reminders Updated",
+            f"Automatic match reminders are now **{status}**.\n"
+            "Reminders are sent 30 minutes before scheduled scrims and practices."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @premier.command(name="help", description="Show help information for all Premier bot commands")
+    async def premier_help(self, interaction: discord.Interaction) -> None:
+        help_text = """
+## Availability Commands
+- `/availability set` - Set your available days
+- `/availability clear` - Clear your availability
+- `/availability mine` - View your current availability
+- `/availability day` - See who's available on specific days
+- `/availability panel` - Post an interactive signup panel
+- `/availability resetweek` - Admin: reset all availability
+
+## Schedule Commands
+- `/schedule preview` - Preview the weekly schedule
+- `/schedule post` - Post schedule to announcement channel
+- `/schedule pingcheck` - Check if ping thresholds are met
+
+## Lineup Commands
+- `/lineup suggest` - Get AI-suggested lineup based on roles
+- `/lineup lock` - Admin: lock a lineup for a day
+- `/lineup view` - View locked lineup for a day
+- `/lineup unlock` - Admin: clear a locked lineup
+
+## Profile Commands
+- `/profile timezone` - Set your timezone
+- `/profile view` - View your full profile
+
+## Agent Commands
+- `/agents set` - Set your roles and agents
+- `/agents mine` - View your saved agents
+- `/agents team` - View team agent compositions
+
+## Config Commands
+- `/config announcement` - Set announcement channel
+- `/config pingrole` - Set ping role
+- `/config teamroles` - Set team A/B roles
+- `/config scrimtime` - Set scrim times
+- `/config practicetime` - Set practice times
+- `/config premier_window` - Set Premier windows
+- `/config map_*` - Set maps for each day
+
+## Admin Commands
+- `/premier status` - View bot configuration
+- `/premier reminders` - Toggle automatic reminders
+"""
+        embed = format_embed("Premier Bot Help", help_text)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class ValorantBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -1666,6 +2258,10 @@ class ValorantBot(commands.Bot):
         self.log_store = GameLogStore()
 
     async def setup_hook(self) -> None:  # type: ignore[override]
+        # Set up global error handler for app commands
+        self.tree.on_error = self._on_app_command_error
+
+        # Core cogs
         await self.add_cog(AvailabilityCog(self, self.availability_store, self.config_store))
         await self.add_cog(ScheduleCog(self, self.availability_store, self.config_store))
         await self.add_cog(ConfigCog(self, self.config_store))
@@ -1673,11 +2269,40 @@ class ValorantBot(commands.Bot):
         await self.add_cog(RoleSyncCog(self, self.availability_store, self.config_store))
         await self.add_cog(GameLogCog(self, self.log_store))
 
+        # New feature cogs
+        await self.add_cog(ProfileCog(self, self.availability_store))
+        await self.add_cog(LineupCog(self, self.availability_store, self.config_store))
+        await self.add_cog(PremierCog(self, self.availability_store, self.config_store, self.log_store))
+
         try:
             synced = await self.tree.sync()
             logging.info("Synced %d app commands", len(synced))
         except discord.HTTPException as exc:
             logging.error("Failed to sync commands: %s", exc)
+
+    async def _on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Global error handler for all app commands."""
+        logging.error("App command error: %s", error, exc_info=error)
+
+        # Determine user-friendly message
+        if isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"This command is on cooldown. Try again in {error.retry_after:.1f}s."
+        elif isinstance(error, app_commands.MissingPermissions):
+            msg = "You don't have permission to use this command."
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            msg = "I don't have the required permissions to do that."
+        elif isinstance(error, app_commands.CheckFailure):
+            msg = "You can't use this command right now."
+        else:
+            msg = "Something went wrong. Please try again."
+            # Log full traceback for unexpected errors
+            logging.error("Full traceback:\n%s", traceback.format_exc())
+
+        # Try to respond to the user
+        embed = error_embed("Command Error", msg)
+        await safe_respond(interaction, embed=embed, ephemeral=True)
 
     async def on_ready(self) -> None:  # type: ignore[override]
         assert self.user is not None

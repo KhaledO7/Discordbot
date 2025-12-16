@@ -1,8 +1,52 @@
 from __future__ import annotations
 
 import json
+import logging
+import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
+
+
+def _atomic_write(path: Path, data: Dict) -> None:
+    """Write JSON data atomically using a temp file and rename."""
+    # Create temp file in same directory to ensure same filesystem
+    fd, tmp_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.stem}_",
+        suffix=".tmp"
+    )
+    try:
+        with open(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        # Atomic rename
+        Path(tmp_path).replace(path)
+    except Exception:
+        # Clean up temp file on error
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _backup_file(path: Path) -> None:
+    """Create a timestamped backup of a file if it exists."""
+    if not path.exists():
+        return
+    backup_dir = path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"{path.stem}_{timestamp}{path.suffix}"
+    try:
+        shutil.copy2(path, backup_path)
+        # Keep only last 10 backups
+        backups = sorted(backup_dir.glob(f"{path.stem}_*{path.suffix}"))
+        for old_backup in backups[:-10]:
+            old_backup.unlink()
+    except Exception as e:
+        logging.warning("Failed to create backup: %s", e)
 
 
 WEEK_DAYS = [
@@ -53,7 +97,8 @@ class AvailabilityStore:
                 "team": Optional[str],
                 "days": ["monday", "tuesday", ...],
                 "roles": [str],      # optional: picked Valorant roles
-                "agents": [str]      # optional: picked agents
+                "agents": [str],     # optional: picked agents
+                "timezone": str      # optional: user's timezone (e.g. "America/New_York")
             }
         }
     }
@@ -67,18 +112,21 @@ class AvailabilityStore:
 
     def _load(self) -> None:
         if self.path.exists():
+            # Backup before loading in case we need to recover
+            _backup_file(self.path)
             try:
-                self._data = json.loads(self.path.read_text())
+                self._data = json.loads(self.path.read_text(encoding='utf-8'))
                 if "users" not in self._data:
                     self._data["users"] = {}
-            except Exception:
+            except Exception as e:
+                logging.error("Failed to load availability data: %s", e)
                 # Corrupted file → reset
                 self._data = {"users": {}}
         else:
             self._persist()
 
     def _persist(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        _atomic_write(self.path, self._data)
 
     # -------- Availability (days + team) --------
 
@@ -184,6 +232,33 @@ class AvailabilityStore:
         entry.pop("agents", None)
         self._persist()
 
+    # -------- Timezone preferences --------
+
+    def set_user_timezone(self, user_id: int, timezone: str) -> None:
+        """Set a user's timezone (e.g., 'America/New_York')."""
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.setdefault(key, {})
+        entry["timezone"] = timezone
+        self._persist()
+
+    def get_user_timezone(self, user_id: int) -> Optional[str]:
+        """Get a user's timezone. Returns None if not set."""
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        return entry.get("timezone")
+
+    def get_user_info(self, user_id: int) -> Dict[str, object]:
+        """Get full user info including days, team, roles, agents, and timezone."""
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        return {
+            "display_name": entry.get("display_name", "Unknown"),
+            "team": entry.get("team"),
+            "days": list(entry.get("days", [])),
+            "roles": list(entry.get("roles", [])),
+            "agents": list(entry.get("agents", [])),
+            "timezone": entry.get("timezone"),
+        }
+
 
 class GuildConfigStore:
     """Track guild-specific config such as announcement channel, ping role,
@@ -198,15 +273,17 @@ class GuildConfigStore:
 
     def _load(self) -> None:
         if self.path.exists():
+            _backup_file(self.path)
             try:
-                self._data = json.loads(self.path.read_text())
-            except Exception:
+                self._data = json.loads(self.path.read_text(encoding='utf-8'))
+            except Exception as e:
+                logging.error("Failed to load guild config: %s", e)
                 self._data = {}
         else:
             self._persist()
 
     def _persist(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        _atomic_write(self.path, self._data)
 
     def _ensure_guild(self, guild_id: int) -> Dict[str, object]:
         gid = str(guild_id)
@@ -408,6 +485,82 @@ class GuildConfigStore:
         # g["practice_maps"] = {d: None for d in WEEK_DAYS}
         self._persist()
 
+    # -------- Lineup Lock --------
+
+    def set_locked_lineup(
+        self, guild_id: int, day: str, player_ids: List[int], match_type: str = "premier"
+    ) -> None:
+        """Lock a lineup for a specific day and match type."""
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        locked = g.setdefault("locked_lineups", {})
+        key = f"{day}_{match_type}"
+        locked[key] = {
+            "player_ids": player_ids,
+            "locked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._persist()
+
+    def get_locked_lineup(
+        self, guild_id: int, day: str, match_type: str = "premier"
+    ) -> Optional[Dict[str, object]]:
+        """Get the locked lineup for a day/match type. Returns None if not locked."""
+        g = self._ensure_guild(guild_id)
+        locked = g.get("locked_lineups", {})
+        key = f"{day.lower()}_{match_type}"
+        return locked.get(key)
+
+    def clear_locked_lineup(self, guild_id: int, day: str, match_type: str = "premier") -> bool:
+        """Clear the locked lineup for a day/match type. Returns True if one was cleared."""
+        g = self._ensure_guild(guild_id)
+        locked = g.get("locked_lineups", {})
+        key = f"{day.lower()}_{match_type}"
+        if key in locked:
+            del locked[key]
+            self._persist()
+            return True
+        return False
+
+    def clear_all_locked_lineups(self, guild_id: int) -> int:
+        """Clear all locked lineups for a guild. Returns count cleared."""
+        g = self._ensure_guild(guild_id)
+        locked = g.get("locked_lineups", {})
+        count = len(locked)
+        if count:
+            g["locked_lineups"] = {}
+            self._persist()
+        return count
+
+    # -------- Reminders configuration --------
+
+    def set_reminder_channel(self, guild_id: int, channel_id: int) -> None:
+        """Set the channel for match reminders."""
+        g = self._ensure_guild(guild_id)
+        g["reminder_channel_id"] = channel_id
+        self._persist()
+
+    def get_reminder_channel(self, guild_id: int) -> Optional[int]:
+        """Get the reminder channel. Falls back to announcement channel if not set."""
+        g = self._ensure_guild(guild_id)
+        cid = g.get("reminder_channel_id")
+        if isinstance(cid, int):
+            return cid
+        # Fall back to announcement channel
+        return self.get_announcement_channel(guild_id)
+
+    def set_reminders_enabled(self, guild_id: int, enabled: bool) -> None:
+        """Enable or disable automatic reminders."""
+        g = self._ensure_guild(guild_id)
+        g["reminders_enabled"] = enabled
+        self._persist()
+
+    def get_reminders_enabled(self, guild_id: int) -> bool:
+        """Check if reminders are enabled. Default True."""
+        g = self._ensure_guild(guild_id)
+        return g.get("reminders_enabled", True)
+
 
 class GameLogStore:
     """Store match logs (scrim/premier/practice) per guild."""
@@ -420,15 +573,17 @@ class GameLogStore:
 
     def _load(self) -> None:
         if self.path.exists():
+            _backup_file(self.path)
             try:
-                self._data = json.loads(self.path.read_text())
-            except Exception:
+                self._data = json.loads(self.path.read_text(encoding='utf-8'))
+            except Exception as e:
+                logging.error("Failed to load match logs: %s", e)
                 self._data = {}
         else:
             self._persist()
 
     def _persist(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        _atomic_write(self.path, self._data)
 
     def _guild_logs(self, guild_id: int) -> List[Dict[str, object]]:
         guilds = self._data.setdefault("guilds", {})
