@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import traceback
 from datetime import datetime, date, time, timedelta
 from functools import lru_cache
@@ -12,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from scheduler import ScheduleBuilder
+from scheduler import ScheduleBuilder, LineupSuggestion, PlayerInfo
 from storage import (
     AvailabilityStore,
     GuildConfigStore,
@@ -1972,7 +1973,6 @@ class LineupCog(commands.Cog):
             return
 
         # Parse player mentions from the string
-        import re
         mention_pattern = r"<@!?(\d+)>"
         matches = re.findall(mention_pattern, players)
 
@@ -2238,11 +2238,503 @@ class PremierCog(commands.Cog):
 - `/config premier_window` - Set Premier windows
 - `/config map_*` - Set maps for each day
 
+## Dashboard & Planning
+- `/dashboard open` - Interactive planning dashboard with navigation
+- `/dashboard rsvp` - Post quick RSVP buttons for fast signups
+- `/dashboard today` - Quick view of today's schedule
+- `/dashboard week` - Weekly availability grid
+- `/dashboard composition` - Analyze team composition for a day
+- `/dashboard countdown` - Countdown to next scheduled event
+
 ## Admin Commands
 - `/premier status` - View bot configuration
 - `/premier reminders` - Toggle automatic reminders
 """
         embed = format_embed("Premier Bot Help", help_text)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ========================== NEW WIDGETS & PLANNING TOOLS ==========================
+
+
+class DashboardView(discord.ui.View):
+    """Interactive dashboard with navigation buttons."""
+
+    def __init__(self, cog: "DashboardCog", guild_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.current_day_index = datetime.now().weekday()
+        self.message: Optional[discord.Message] = None
+
+    def _get_day_embed(self) -> discord.Embed:
+        """Generate embed for the current day view."""
+        day = WEEK_DAYS[self.current_day_index]
+        users = self.cog.availability_store.users_for_day(day)
+
+        # Count teams
+        team_a = sum(1 for u in users if str(u.get("team", "")).upper() == "A")
+        team_b = sum(1 for u in users if str(u.get("team", "")).upper() == "B")
+
+        # Get times
+        scrim = self.cog.config_store.get_scrim_time(self.guild_id, day)
+        practice = self.cog.config_store.get_practice_time(self.guild_id, day)
+        premier = self.cog.config_store.get_premier_window(self.guild_id, day)
+
+        # Build player list
+        if users:
+            player_list = "\n".join(f"• {u['display_name']}" for u in users[:10])
+            if len(users) > 10:
+                player_list += f"\n... and {len(users) - 10} more"
+        else:
+            player_list = "_No signups yet_"
+
+        # Status indicators
+        status_lines = []
+        if premier:
+            status_lines.append(f"🏆 **Premier:** `{premier}`")
+        if scrim:
+            ready = "✅" if len(users) >= 10 else "⏳"
+            status_lines.append(f"{ready} **Scrim:** `{scrim}` ({len(users)}/10)")
+        if practice:
+            ready = "✅" if len(users) >= 5 else "⏳"
+            status_lines.append(f"{ready} **Practice:** `{practice}` ({len(users)}/5)")
+
+        if not status_lines:
+            status_lines.append("_No events scheduled_")
+
+        embed = discord.Embed(
+            title=f"📅 {day.title()} Dashboard",
+            color=discord.Color.blue() if len(users) >= 5 else discord.Color.orange(),
+        )
+        embed.add_field(
+            name="📊 Availability",
+            value=f"**Total:** {len(users)} players\n**Team A:** {team_a} | **Team B:** {team_b}",
+            inline=True,
+        )
+        embed.add_field(
+            name="🎮 Events",
+            value="\n".join(status_lines),
+            inline=True,
+        )
+        embed.add_field(
+            name="👥 Players",
+            value=player_list,
+            inline=False,
+        )
+        embed.set_footer(text=f"Use ◀️ ▶️ to navigate days • Day {self.current_day_index + 1}/7")
+        return embed
+
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_day(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.current_day_index = (self.current_day_index - 1) % 7
+        await interaction.response.edit_message(embed=self._get_day_embed(), view=self)
+
+    @discord.ui.button(label="Today", style=discord.ButtonStyle.primary)
+    async def today(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.current_day_index = datetime.now().weekday()
+        await interaction.response.edit_message(embed=self._get_day_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.secondary)
+    async def next_day(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.current_day_index = (self.current_day_index + 1) % 7
+        await interaction.response.edit_message(embed=self._get_day_embed(), view=self)
+
+    @discord.ui.button(label="📋 Week Overview", style=discord.ButtonStyle.success, row=1)
+    async def week_overview(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Show full week summary."""
+        lines = []
+        for i, day in enumerate(WEEK_DAYS):
+            users = self.cog.availability_store.users_for_day(day)
+            count = len(users)
+            emoji = "✅" if count >= 5 else "⚠️" if count >= 3 else "❌"
+            today_marker = " 👈" if i == datetime.now().weekday() else ""
+            lines.append(f"{emoji} **{day.title()}:** {count} players{today_marker}")
+
+        embed = format_embed("📊 Week Overview", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=self._get_day_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class QuickRSVPView(discord.ui.View):
+    """Quick RSVP buttons for fast signup."""
+
+    def __init__(self, cog: "DashboardCog") -> None:
+        super().__init__(timeout=3600)  # 1 hour
+        self.cog = cog
+        self.message: Optional[discord.Message] = None
+
+    async def _toggle_day(self, interaction: discord.Interaction, day: str) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use in a server.", ephemeral=True)
+            return
+
+        current_days = set(self.cog.availability_store.get_user_days(member.id))
+        if day in current_days:
+            current_days.remove(day)
+            action = "removed from"
+        else:
+            current_days.add(day)
+            action = "added to"
+
+        # Get team info
+        guild_id = member.guild.id if member.guild else None
+        configured_roles = self.cog.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
+        team = infer_team(member, None, configured_roles, env_team_roles())
+
+        self.cog.availability_store.set_availability(
+            user_id=member.id,
+            display_name=member.display_name,
+            team=team,
+            days=list(current_days),
+        )
+
+        await interaction.response.send_message(
+            f"✅ **{day.title()}** {action} your availability!",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Mon", style=discord.ButtonStyle.secondary)
+    async def monday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "monday")
+
+    @discord.ui.button(label="Tue", style=discord.ButtonStyle.secondary)
+    async def tuesday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "tuesday")
+
+    @discord.ui.button(label="Wed", style=discord.ButtonStyle.primary)
+    async def wednesday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "wednesday")
+
+    @discord.ui.button(label="Thu", style=discord.ButtonStyle.primary)
+    async def thursday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "thursday")
+
+    @discord.ui.button(label="Fri", style=discord.ButtonStyle.success)
+    async def friday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "friday")
+
+    @discord.ui.button(label="Sat", style=discord.ButtonStyle.success, row=1)
+    async def saturday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "saturday")
+
+    @discord.ui.button(label="Sun", style=discord.ButtonStyle.success, row=1)
+    async def sunday(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._toggle_day(interaction, "sunday")
+
+    @discord.ui.button(label="✅ All Week", style=discord.ButtonStyle.primary, row=1)
+    async def all_week(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use in a server.", ephemeral=True)
+            return
+
+        guild_id = member.guild.id if member.guild else None
+        configured_roles = self.cog.config_store.get_team_roles(guild_id) if guild_id else {"A": None, "B": None}
+        team = infer_team(member, None, configured_roles, env_team_roles())
+
+        self.cog.availability_store.set_availability(
+            user_id=member.id,
+            display_name=member.display_name,
+            team=team,
+            days=list(WEEK_DAYS),
+        )
+        await interaction.response.send_message("✅ Marked available for **all week**!", ephemeral=True)
+
+    @discord.ui.button(label="🗑️ Clear", style=discord.ButtonStyle.danger, row=1)
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use in a server.", ephemeral=True)
+            return
+
+        self.cog.availability_store.clear_user(member.id)
+        await interaction.response.send_message("🗑️ Cleared all your availability!", ephemeral=True)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class DashboardCog(commands.Cog):
+    """Dashboard and planning tools."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        availability_store: AvailabilityStore,
+        config_store: GuildConfigStore,
+    ) -> None:
+        self.bot = bot
+        self.availability_store = availability_store
+        self.config_store = config_store
+        self.schedule_builder = ScheduleBuilder(availability_store, config_store)
+
+    dashboard = app_commands.Group(name="dashboard", description="Interactive planning dashboard")
+
+    @dashboard.command(name="open", description="Open the interactive planning dashboard")
+    async def dashboard_open(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run in a server.", ephemeral=True)
+            return
+
+        view = DashboardView(self, interaction.guild.id)
+        embed = view._get_day_embed()
+        await interaction.response.send_message(embed=embed, view=view)
+
+    @dashboard.command(name="rsvp", description="Post a quick RSVP panel for fast signups")
+    async def dashboard_rsvp(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message("Run in a server channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        embed = format_embed(
+            "⚡ Quick RSVP",
+            "Click the day buttons to **toggle** your availability.\n"
+            "• Click once to **add** a day\n"
+            "• Click again to **remove** it\n"
+            "• Use **All Week** to sign up for everything",
+            color=discord.Color.blue(),
+        )
+        view = QuickRSVPView(self)
+        msg = await interaction.channel.send(embed=embed, view=view)
+        view.message = msg
+        await interaction.followup.send("RSVP panel posted!", ephemeral=True)
+
+    @dashboard.command(name="today", description="Quick view of today's schedule and availability")
+    async def dashboard_today(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run in a server.", ephemeral=True)
+            return
+
+        today_idx = datetime.now().weekday()
+        today = WEEK_DAYS[today_idx]
+        users = self.availability_store.users_for_day(today)
+
+        # Get times
+        guild_id = interaction.guild.id
+        scrim = self.config_store.get_scrim_time(guild_id, today)
+        practice = self.config_store.get_practice_time(guild_id, today)
+        premier = self.config_store.get_premier_window(guild_id, today)
+        premier_map = self.config_store.get_premier_map(guild_id, today)
+
+        # Build embed
+        lines = [f"**Date:** {datetime.now().strftime('%A, %B %d, %Y')}"]
+        lines.append(f"**Available:** {len(users)} players")
+        lines.append("")
+
+        # Events
+        if premier:
+            map_str = f" on **{premier_map}**" if premier_map else ""
+            lines.append(f"🏆 **Premier Match:** `{premier}`{map_str}")
+        if scrim:
+            status = "✅ READY" if len(users) >= 10 else f"⏳ Need {10 - len(users)} more"
+            lines.append(f"⚔️ **Scrim:** `{scrim}` — {status}")
+        if practice:
+            status = "✅ READY" if len(users) >= 5 else f"⏳ Need {5 - len(users)} more"
+            lines.append(f"🎯 **Practice:** `{practice}` — {status}")
+
+        if not any([premier, scrim, practice]):
+            lines.append("_No events scheduled for today_")
+
+        lines.append("")
+
+        # Player list
+        if users:
+            lines.append("**Players:**")
+            for u in users[:15]:
+                team_str = f" (Team {u.get('team')})" if u.get('team') else ""
+                lines.append(f"• {u['display_name']}{team_str}")
+            if len(users) > 15:
+                lines.append(f"_... and {len(users) - 15} more_")
+        else:
+            lines.append("_No one has signed up yet!_")
+
+        embed = format_embed(f"📅 Today: {today.title()}", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @dashboard.command(name="week", description="Show the full week availability grid")
+    async def dashboard_week(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run in a server.", ephemeral=True)
+            return
+
+        today_idx = datetime.now().weekday()
+        lines = ["```"]
+        lines.append("Day       | Players | Status")
+        lines.append("----------|---------|--------")
+
+        for i, day in enumerate(WEEK_DAYS):
+            users = self.availability_store.users_for_day(day)
+            count = len(users)
+            if count >= 10:
+                status = "SCRIM ✓"
+            elif count >= 5:
+                status = "PRAC ✓"
+            elif count >= 3:
+                status = "LOW"
+            else:
+                status = "—"
+
+            marker = "→" if i == today_idx else " "
+            lines.append(f"{marker}{day.title():<8} | {count:>7} | {status}")
+
+        lines.append("```")
+
+        # Add summary
+        total_signups = sum(len(self.availability_store.users_for_day(d)) for d in WEEK_DAYS)
+        unique_users = len(self.availability_store.all_users())
+
+        lines.append(f"\n**Total signups:** {total_signups} across {unique_users} unique players")
+
+        embed = format_embed("📊 Weekly Availability Grid", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @dashboard.command(name="composition", description="Analyze team composition for a day")
+    @app_commands.describe(day="Day to analyze")
+    @app_commands.choices(day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS])
+    async def dashboard_composition(
+        self, interaction: discord.Interaction, day: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run in a server.", ephemeral=True)
+            return
+
+        users = self.availability_store.users_for_day(day.value)
+
+        if len(users) < 5:
+            embed = error_embed(
+                "Not Enough Players",
+                f"Only {len(users)} players available on {day.name}.\n"
+                "Need at least 5 to analyze composition."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Count roles
+        role_counts: Dict[str, int] = {"controller": 0, "sentinel": 0, "initiator": 0, "duelist": 0}
+        players_by_role: Dict[str, List[str]] = {r: [] for r in role_counts}
+
+        for u in users:
+            roles = u.get("roles", [])
+            for r in roles:
+                r_lower = r.lower()
+                if r_lower in role_counts:
+                    role_counts[r_lower] += 1
+                    players_by_role[r_lower].append(u["display_name"])
+
+        # Build analysis
+        lines = [f"**Available:** {len(users)} players\n"]
+
+        lines.append("**Role Coverage:**")
+        for role in ["controller", "sentinel", "initiator", "duelist"]:
+            count = role_counts[role]
+            emoji = "✅" if count >= 1 else "❌"
+            players = ", ".join(players_by_role[role][:3])
+            if len(players_by_role[role]) > 3:
+                players += f" +{len(players_by_role[role]) - 3}"
+            lines.append(f"{emoji} **{role.title()}:** {count} — {players or '_none_'}")
+
+        # Recommendations
+        missing = [r.title() for r, c in role_counts.items() if c == 0]
+        lines.append("")
+        if missing:
+            lines.append(f"⚠️ **Missing:** {', '.join(missing)}")
+        else:
+            lines.append("✅ **All roles covered!**")
+
+        # Flex players (multiple roles)
+        flex_players = [u["display_name"] for u in users if len(u.get("roles", [])) >= 2]
+        if flex_players:
+            lines.append(f"\n🔄 **Flex players:** {', '.join(flex_players[:5])}")
+
+        embed = format_embed(f"🎯 Team Composition: {day.name}", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @dashboard.command(name="countdown", description="Show countdown to next scheduled event")
+    async def dashboard_countdown(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run in a server.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        now = datetime.now()
+        today_idx = now.weekday()
+
+        # Find next event
+        events = []
+        for offset in range(7):
+            day_idx = (today_idx + offset) % 7
+            day = WEEK_DAYS[day_idx]
+
+            scrim = self.config_store.get_scrim_time(guild_id, day)
+            practice = self.config_store.get_practice_time(guild_id, day)
+            premier = self.config_store.get_premier_window(guild_id, day)
+
+            for event_name, time_str in [("Scrim", scrim), ("Practice", practice), ("Premier", premier)]:
+                if time_str:
+                    # Parse time
+                    try:
+                        if "-" in time_str:
+                            time_str = time_str.split("-")[0]
+                        t = _parse_hhmm_to_time(time_str)
+                        if t:
+                            event_date = now.date() + timedelta(days=offset)
+                            event_dt = datetime.combine(event_date, t)
+                            if event_dt > now:
+                                events.append((event_dt, event_name, day))
+                    except Exception:
+                        pass
+
+        if not events:
+            embed = format_embed("⏰ Countdown", "No upcoming events scheduled!")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Sort and show next 3
+        events.sort(key=lambda x: x[0])
+        lines = []
+        for event_dt, event_name, day in events[:3]:
+            delta = event_dt - now
+            hours, remainder = divmod(int(delta.total_seconds()), 3600)
+            minutes = remainder // 60
+
+            if hours >= 24:
+                days = hours // 24
+                time_str = f"in **{days}d {hours % 24}h**"
+            elif hours > 0:
+                time_str = f"in **{hours}h {minutes}m**"
+            else:
+                time_str = f"in **{minutes} minutes**"
+
+            emoji = "🏆" if event_name == "Premier" else "⚔️" if event_name == "Scrim" else "🎯"
+            lines.append(f"{emoji} **{event_name}** ({day.title()}) — {time_str}")
+            lines.append(f"   `{event_dt.strftime('%I:%M %p')}` on `{event_dt.strftime('%b %d')}`")
+            lines.append("")
+
+        embed = format_embed("⏰ Upcoming Events", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -2273,6 +2765,9 @@ class ValorantBot(commands.Bot):
         await self.add_cog(ProfileCog(self, self.availability_store))
         await self.add_cog(LineupCog(self, self.availability_store, self.config_store))
         await self.add_cog(PremierCog(self, self.availability_store, self.config_store, self.log_store))
+
+        # Dashboard and planning tools
+        await self.add_cog(DashboardCog(self, self.availability_store, self.config_store))
 
         try:
             synced = await self.tree.sync()
