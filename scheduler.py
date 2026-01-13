@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
+from datetime import time
+from typing import Dict, List, Optional, Callable, Any, Tuple
 
-from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS
+from storage import AvailabilityStore, GuildConfigStore, WEEK_DAYS, DAY_TYPES
 
 
 # Role priorities for balanced team composition
 ROLE_PRIORITY = ["controller", "sentinel", "initiator", "duelist"]
+
+# Day type icons for display
+DAY_TYPE_ICONS = {
+    "FREE": "🟢",
+    "PREMIER": "🏆",
+    "SCRIM": "⚔️",
+    "VOD": "🎬",
+    "MIXED": "🔀",
+    "OFF": "⛔",
+}
 
 
 @dataclass
@@ -30,8 +41,52 @@ class LineupSuggestion:
 
 
 @dataclass
+class ScrimSlot:
+    """Information about a scrim slot."""
+    slot_number: int
+    start_time: str
+    available_count: int
+    available_names: List[str]
+
+    def format_display(self, max_names: int = 5) -> str:
+        """Format for display, truncating names if needed."""
+        if not self.available_names:
+            names_str = "No signups"
+        elif len(self.available_names) <= max_names:
+            names_str = ", ".join(self.available_names)
+        else:
+            shown = self.available_names[:max_names]
+            remaining = len(self.available_names) - max_names
+            names_str = f"{', '.join(shown)} +{remaining} more"
+        return f"Scrim #{self.slot_number} @ `{self.start_time}` — **{self.available_count}** ({names_str})"
+
+
+@dataclass
+class VodSession:
+    """Information about a VOD review session."""
+    start_time: str
+    duration_minutes: int
+    available_count: int
+    available_names: List[str]
+
+    def format_display(self, max_names: int = 5) -> str:
+        """Format for display."""
+        if not self.available_names:
+            names_str = "No signups"
+        elif len(self.available_names) <= max_names:
+            names_str = ", ".join(self.available_names)
+        else:
+            shown = self.available_names[:max_names]
+            remaining = len(self.available_names) - max_names
+            names_str = f"{', '.join(shown)} +{remaining} more"
+        return f"VOD @ `{self.start_time}` ({self.duration_minutes}min) — **{self.available_count}** ({names_str})"
+
+
+@dataclass
 class DaySummary:
     day: str
+    day_type: str
+    day_label: Optional[str]
     total_available: int
     team_counts: Dict[str, int]
     premier_team: Optional[str]
@@ -48,70 +103,103 @@ class DaySummary:
     available_names: List[str]
     lineup_suggestion: Optional[LineupSuggestion] = None
     locked_lineup_ids: Optional[List[int]] = None
+    scrim_slots: List[ScrimSlot] = field(default_factory=list)
+    vod_session: Optional[VodSession] = None
 
     def to_lines(self) -> str:
-        # Premier line
-        if self.premier_window is None:
-            premier_status = "Premier: **OFF**"
-        else:
-            premier_map_suffix = f" · Map: **{self.premier_map}**" if self.premier_map else ""
-            if self.premier_team:
-                premier_status = (
-                    f"Premier: **Team {self.premier_team}** @ `{self.premier_window}`"
-                    f"{premier_map_suffix}"
-                )
-            else:
-                premier_status = (
-                    f"Premier: needs **5** from Team A or B @ `{self.premier_window}`"
-                    f"{premier_map_suffix}"
-                )
+        """Format day summary for Discord display."""
+        # Day header with type icon
+        icon = DAY_TYPE_ICONS.get(self.day_type, "")
+        label_suffix = f" — {self.day_label}" if self.day_label else ""
+        header = f"### {icon} {self.day.title()}{label_suffix}"
 
-        # Practice line
-        if self.practice_time is None:
-            practice_status = "Practice: **OFF**"
-        else:
-            practice_map_suffix = f" · Map: **{self.practice_map}**" if self.practice_map else ""
-            if self.practice_ready:
-                practice_status = (
-                    f"Practice: **READY** ({self.total_available} players) "
-                    f"@ `{self.practice_time}`{practice_map_suffix}"
-                )
-            else:
-                practice_status = (
-                    f"Practice: needs **{self.practice_missing}** more for 5 "
-                    f"@ `{self.practice_time}`{practice_map_suffix}"
-                )
+        lines = [header]
 
-        # Scrim line
-        if self.scrim_time is None:
-            scrim_status = "Scrim: **OFF**"
-        else:
-            scrim_map_suffix = f" · Map: **{self.scrim_map}**" if self.scrim_map else ""
-            if self.scrim_ready:
-                scrim_status = (
-                    f"Scrim: **READY** ({self.total_available} players) "
-                    f"@ `{self.scrim_time}`{scrim_map_suffix}"
-                )
-            else:
-                scrim_status = (
-                    f"Scrim: needs **{self.scrim_missing}** more for 10 "
-                    f"@ `{self.scrim_time}`{scrim_map_suffix}"
-                )
+        # Show content based on day type
+        if self.day_type == "FREE":
+            lines.append("_Free day — no activities scheduled_")
+            return "\n".join(lines) + "\n"
 
+        if self.day_type == "OFF":
+            lines.append("_Day off — no activities scheduled_")
+            return "\n".join(lines) + "\n"
+
+        # Premier section (show for PREMIER or MIXED)
+        if self.day_type in ("PREMIER", "MIXED"):
+            if self.premier_window is None:
+                premier_status = "🏆 Premier: **OFF**"
+            else:
+                premier_map_suffix = f" · Map: **{self.premier_map}**" if self.premier_map else ""
+                if self.premier_team:
+                    premier_status = (
+                        f"🏆 Premier: **Team {self.premier_team}** @ `{self.premier_window}`"
+                        f"{premier_map_suffix}"
+                    )
+                else:
+                    premier_status = (
+                        f"🏆 Premier: needs **5** from Team A or B @ `{self.premier_window}`"
+                        f"{premier_map_suffix}"
+                    )
+            lines.append(f"- {premier_status}")
+
+        # Scrim section (show for SCRIM or MIXED)
+        if self.day_type in ("SCRIM", "MIXED"):
+            if self.scrim_slots:
+                lines.append("- ⚔️ **Scrims:**")
+                for slot in self.scrim_slots:
+                    lines.append(f"  - {slot.format_display()}")
+            elif self.scrim_time is not None:
+                scrim_map_suffix = f" · Map: **{self.scrim_map}**" if self.scrim_map else ""
+                if self.scrim_ready:
+                    scrim_status = (
+                        f"⚔️ Scrim: **READY** ({self.total_available} players) "
+                        f"@ `{self.scrim_time}`{scrim_map_suffix}"
+                    )
+                else:
+                    scrim_status = (
+                        f"⚔️ Scrim: needs **{self.scrim_missing}** more for 10 "
+                        f"@ `{self.scrim_time}`{scrim_map_suffix}"
+                    )
+                lines.append(f"- {scrim_status}")
+            else:
+                lines.append("- ⚔️ Scrim: **OFF**")
+
+        # VOD section (show for VOD or MIXED)
+        if self.day_type in ("VOD", "MIXED"):
+            if self.vod_session:
+                lines.append(f"- 🎬 {self.vod_session.format_display()}")
+            else:
+                lines.append("- 🎬 VOD: **OFF**")
+
+        # Practice section (show for any activity day)
+        if self.day_type not in ("FREE", "OFF"):
+            if self.practice_time is not None:
+                practice_map_suffix = f" · Map: **{self.practice_map}**" if self.practice_map else ""
+                if self.practice_ready:
+                    practice_status = (
+                        f"Practice: **READY** ({self.total_available} players) "
+                        f"@ `{self.practice_time}`{practice_map_suffix}"
+                    )
+                else:
+                    practice_status = (
+                        f"Practice: needs **{self.practice_missing}** more for 5 "
+                        f"@ `{self.practice_time}`{practice_map_suffix}"
+                    )
+                lines.append(f"- {practice_status}")
+
+        # Availability summary
         team_lines = ", ".join(
             f"Team {team}: {count}" for team, count in sorted(self.team_counts.items())
         ) or "No teams set"
 
-        names = ", ".join(self.available_names) if self.available_names else "No signups"
+        names = ", ".join(self.available_names[:8]) if self.available_names else "No signups"
+        if len(self.available_names) > 8:
+            names += f" +{len(self.available_names) - 8} more"
 
-        return (
-            f"### {self.day.title()}\n"
-            f"- {premier_status}\n"
-            f"- {practice_status}\n"
-            f"- {scrim_status}\n"
-            f"- Availability: **{self.total_available}** ({names})\n"
-            f"- Teams: {team_lines}\n"
-        )
+        lines.append(f"- 👥 **{self.total_available}** available ({names})")
+        lines.append(f"- Teams: {team_lines}")
+
+        return "\n".join(lines) + "\n"
 
 
 class ScheduleBuilder:
@@ -130,7 +218,19 @@ class ScheduleBuilder:
         """
         summaries: List[DaySummary] = []
 
+        # Get scrim slot config
+        scrims_per_day = self.config_store.get_scrims_per_day(guild_id)
+        scrim_spacing = self.config_store.get_scrim_spacing(guild_id)
+
+        # Get VOD config
+        vod_start_time = self.config_store.get_vod_start_time(guild_id)
+        vod_duration = self.config_store.get_vod_session_minutes(guild_id)
+
         for day in WEEK_DAYS:
+            # Get day type and label
+            day_type = self.config_store.get_day_type(guild_id, day)
+            day_label = self.config_store.get_day_label(guild_id, day)
+
             users = self.availability_store.users_for_day(day)
             team_counts: Dict[str, int] = {"A": 0, "B": 0}
             names: List[str] = []
@@ -180,9 +280,30 @@ class ScheduleBuilder:
             if locked_lineup:
                 locked_lineup_ids = locked_lineup.get("player_ids", [])
 
+            # Build scrim slots if day type allows scrims
+            scrim_slots: List[ScrimSlot] = []
+            if day_type in ("SCRIM", "MIXED") and scrim_time:
+                scrim_slots = self._build_scrim_slots(
+                    guild_id, day, scrim_time, scrims_per_day, scrim_spacing
+                )
+
+            # Build VOD session if day type allows
+            vod_session: Optional[VodSession] = None
+            if day_type in ("VOD", "MIXED"):
+                vod_users = self.availability_store.users_for_vod_day(day)
+                if vod_users or vod_start_time:
+                    vod_session = VodSession(
+                        start_time=vod_start_time,
+                        duration_minutes=vod_duration,
+                        available_count=len(vod_users),
+                        available_names=[u["display_name"] for u in vod_users],
+                    )
+
             summaries.append(
                 DaySummary(
                     day=day,
+                    day_type=day_type,
+                    day_label=day_label,
                     total_available=total,
                     team_counts=team_counts,
                     premier_team=premier_team,
@@ -199,10 +320,51 @@ class ScheduleBuilder:
                     available_names=names,
                     lineup_suggestion=lineup_suggestion,
                     locked_lineup_ids=locked_lineup_ids,
+                    scrim_slots=scrim_slots,
+                    vod_session=vod_session,
                 )
             )
 
         return summaries
+
+    def _build_scrim_slots(
+        self,
+        guild_id: int,
+        day: str,
+        base_time: str,
+        num_slots: int,
+        spacing_minutes: int,
+    ) -> List[ScrimSlot]:
+        """Build scrim slot information for a day."""
+        slots = []
+
+        # Parse base time
+        try:
+            parts = base_time.split(":")
+            base_hour = int(parts[0])
+            base_minute = int(parts[1]) if len(parts) > 1 else 0
+        except (ValueError, IndexError):
+            return slots
+
+        for i in range(num_slots):
+            slot_num = i + 1
+            # Calculate slot time
+            total_minutes = base_hour * 60 + base_minute + (i * spacing_minutes)
+            slot_hour = (total_minutes // 60) % 24
+            slot_minute = total_minutes % 60
+            slot_time = f"{slot_hour:02d}:{slot_minute:02d}"
+
+            # Get users available for this slot
+            slot_users = self.availability_store.users_for_scrim_slot(day, slot_num)
+
+            slots.append(ScrimSlot(
+                slot_number=slot_num,
+                start_time=slot_time,
+                available_count=len(slot_users),
+                available_names=[u["display_name"] for u in slot_users],
+            ))
+
+        return slots
 
     @staticmethod
     def _select_premier_team(team_counts: Dict[str, int]) -> Optional[str]:
@@ -277,11 +439,65 @@ class ScheduleBuilder:
     @staticmethod
     def format_schedule(guild_name: str, summaries: List[DaySummary]) -> str:
         """Format the schedule for display in Discord."""
+        # Count stats
+        total_premier_days = sum(1 for s in summaries if s.day_type == "PREMIER")
+        total_scrim_days = sum(1 for s in summaries if s.day_type in ("SCRIM", "MIXED") and s.scrim_time)
+        total_vod_days = sum(1 for s in summaries if s.day_type in ("VOD", "MIXED"))
+        total_available = sum(s.total_available for s in summaries)
+
         header = (
-            f"## Weekly Valorant Schedule — {guild_name}\n"
-            "_Premier windows, scrim times, practice, and maps are **server-configurable** via `/config`._\n\n"
+            f"## 📅 Weekly Schedule — {guild_name}\n"
+            f"_🏆 {total_premier_days} Premier days · ⚔️ {total_scrim_days} Scrim days · 🎬 {total_vod_days} VOD days_\n"
+            f"_👥 {total_available} total signups this week_\n\n"
         )
         lines = [header]
         for summary in summaries:
             lines.append(summary.to_lines())
+
+        footer = (
+            "\n---\n"
+            "_Use `/availability panel` to sign up · `/premier days view` to see day types_"
+        )
+        lines.append(footer)
         return "\n".join(lines)
+
+    def build_dashboard_embed(
+        self,
+        guild_id: int,
+        guild_name: str,
+        view_mode: str = "all"
+    ) -> Tuple[str, str]:
+        """Build dashboard content with optional view filtering.
+
+        Args:
+            guild_id: The guild ID
+            guild_name: The guild name
+            view_mode: 'all', 'premier', 'scrim', or 'vod'
+
+        Returns:
+            Tuple of (title, description)
+        """
+        summaries = self.build_week(guild_id)
+
+        # Filter based on view mode
+        if view_mode == "premier":
+            summaries = [s for s in summaries if s.day_type == "PREMIER"]
+            title = f"🏆 Premier Schedule — {guild_name}"
+        elif view_mode == "scrim":
+            summaries = [s for s in summaries if s.day_type in ("SCRIM", "MIXED")]
+            title = f"⚔️ Scrim Schedule — {guild_name}"
+        elif view_mode == "vod":
+            summaries = [s for s in summaries if s.day_type in ("VOD", "MIXED")]
+            title = f"🎬 VOD Schedule — {guild_name}"
+        else:
+            title = f"📅 Weekly Schedule — {guild_name}"
+
+        if not summaries:
+            description = "_No days configured for this view._\n\nUse `/premier days set` to configure day types."
+        else:
+            lines = []
+            for summary in summaries:
+                lines.append(summary.to_lines())
+            description = "\n".join(lines)
+
+        return title, description

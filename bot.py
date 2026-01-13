@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import traceback
 from datetime import datetime, date, time, timedelta
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Set, Any
+from typing import Dict, List, Optional, Tuple, Set, Any, Callable, TypeVar
 
 import discord
 from discord import app_commands
@@ -18,7 +19,11 @@ from storage import (
     GuildConfigStore,
     GameLogStore,
     WEEK_DAYS,
+    DAY_TYPES,
 )
+
+# Type variable for generic functions
+T = TypeVar('T')
 
 logging.basicConfig(level=logging.INFO)
 
@@ -153,6 +158,26 @@ def format_embed(title: str, description: str, color: discord.Color = None) -> d
     return discord.Embed(title=title, description=description, color=color)
 
 
+def has_captain_permission(
+    member: discord.Member,
+    config_store: GuildConfigStore,
+) -> bool:
+    """Check if a member has captain/admin permissions.
+
+    Returns True if member is admin, has manage_guild, or has the captain role.
+    """
+    if member.guild_permissions.administrator:
+        return True
+    if member.guild_permissions.manage_guild:
+        return True
+
+    captain_role_id = config_store.get_captain_role(member.guild.id)
+    if captain_role_id:
+        return any(r.id == captain_role_id for r in member.roles)
+
+    return False
+
+
 def error_embed(title: str, description: str) -> discord.Embed:
     """Create an error-styled embed."""
     return discord.Embed(title=f"Error: {title}", description=description, color=discord.Color.red())
@@ -169,15 +194,61 @@ async def safe_respond(
     embed: discord.Embed = None,
     view: discord.ui.View = None,
     ephemeral: bool = True,
-) -> None:
-    """Safely respond to an interaction, handling already-responded cases."""
+) -> bool:
+    """Safely respond to an interaction, handling already-responded cases.
+
+    Returns True if response succeeded, False otherwise.
+    """
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        logging.warning("Interaction expired or not found")
+        return False
     except discord.HTTPException as e:
         logging.error("Failed to respond to interaction: %s", e)
+        return False
+
+
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -> bool:
+    """Safely defer an interaction response.
+
+    Returns True if defer succeeded, False otherwise.
+    """
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        logging.warning("Interaction expired before defer")
+        return False
+    except discord.HTTPException as e:
+        logging.error("Failed to defer interaction: %s", e)
+        return False
+
+
+async def safe_edit_message(
+    message: discord.Message,
+    content: str = None,
+    embed: discord.Embed = None,
+    view: discord.ui.View = None,
+) -> bool:
+    """Safely edit a message, handling missing message cases.
+
+    Returns True if edit succeeded, False otherwise.
+    """
+    try:
+        await message.edit(content=content, embed=embed, view=view)
+        return True
+    except discord.NotFound:
+        logging.warning("Message not found for edit")
+        return False
+    except discord.HTTPException as e:
+        logging.error("Failed to edit message: %s", e)
+        return False
 
 
 def _parse_hhmm_to_time(label: str) -> Optional[time]:
@@ -195,6 +266,36 @@ def _parse_hhmm_to_time(label: str) -> Optional[time]:
         return None
 
 
+# -------------------------- Persistent View Base --------------------------
+
+
+class PersistentView(discord.ui.View):
+    """Base class for views that handle timeouts gracefully."""
+
+    def __init__(self, timeout: float = 3600.0) -> None:
+        super().__init__(timeout=timeout)
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        """Disable all components when the view times out."""
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message:
+            await safe_edit_message(self.message, view=self)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        """Handle errors in view interactions gracefully."""
+        logging.error("View interaction error: %s", error, exc_info=error)
+        embed = error_embed("Interaction Error", "Something went wrong. Please try again.")
+        await safe_respond(interaction, embed=embed, ephemeral=True)
+
+
 # -------------------------- Availability UI --------------------------
 
 # Day emoji mapping for better visual presentation
@@ -208,25 +309,59 @@ DAY_EMOJIS = {
     "sunday": "7️⃣",
 }
 
+# Day type icons for display
+DAY_TYPE_ICONS = {
+    "FREE": "🟢",
+    "PREMIER": "🏆",
+    "SCRIM": "⚔️",
+    "VOD": "🎬",
+    "MIXED": "🔀",
+    "OFF": "⛔",
+}
+
 
 class AvailabilitySelect(discord.ui.Select):
-    def __init__(self, cog: "AvailabilityCog") -> None:
-        options = [
-            discord.SelectOption(
+    def __init__(self, cog: "AvailabilityCog", guild_id: Optional[int] = None) -> None:
+        self.cog = cog
+        self.guild_id = guild_id
+
+        # Build options filtering out FREE and OFF days
+        options = []
+        selectable_days = []
+
+        for day in WEEK_DAYS:
+            day_type = "MIXED"  # Default if no guild
+            if guild_id:
+                day_type = cog.config_store.get_day_type(guild_id, day)
+
+            # Skip FREE and OFF days
+            if day_type in ("FREE", "OFF"):
+                continue
+
+            icon = DAY_TYPE_ICONS.get(day_type, "")
+            options.append(discord.SelectOption(
                 label=day.title(),
                 value=day,
                 emoji=DAY_EMOJIS.get(day, None),
-                description=f"Available on {day.title()}"
-            )
-            for day in WEEK_DAYS
-        ]
+                description=f"{icon} {day_type} day"
+            ))
+            selectable_days.append(day)
+
+        # If all days are filtered out, show a placeholder option
+        if not options:
+            options.append(discord.SelectOption(
+                label="No days available",
+                value="none",
+                description="All days are marked as FREE or OFF"
+            ))
+
         super().__init__(
             placeholder="Select days you can play (multi-select)",
             min_values=1,
-            max_values=len(options),
+            max_values=max(1, len(options)),
             options=options,
         )
-        self.cog = cog
+        self.selectable_days = selectable_days
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         member = interaction.user
@@ -234,7 +369,23 @@ class AvailabilitySelect(discord.ui.Select):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        saved_days, team = await self.cog._save_availability(member, list(self.values), None)
+        # Handle "none" placeholder
+        if "none" in self.values:
+            await interaction.response.send_message(
+                "No days are available for signup. All days are marked as FREE or OFF.",
+                ephemeral=True
+            )
+            return
+
+        # Filter to only valid selectable days
+        valid_days = [d for d in self.values if d in self.selectable_days]
+        if not valid_days:
+            await interaction.response.send_message(
+                "Please select at least one valid day.", ephemeral=True
+            )
+            return
+
+        saved_days, team = await self.cog._save_availability(member, valid_days, None)
         pretty_days = ", ".join(day.title() for day in saved_days)
 
         embed = success_embed(
@@ -263,22 +414,34 @@ class AvailabilityClearButton(discord.ui.Button):
 
 
 class AvailabilityAllWeekButton(discord.ui.Button):
-    """Quick button to mark available for all days."""
+    """Quick button to mark available for all active days."""
     def __init__(self, cog: "AvailabilityCog") -> None:
-        super().__init__(style=discord.ButtonStyle.success, label="Available All Week", emoji="✅")
+        super().__init__(style=discord.ButtonStyle.success, label="Available All Active Days", emoji="✅")
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         member = interaction.user
-        if not isinstance(member, discord.Member):
+        if not isinstance(member, discord.Member) or not interaction.guild:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        saved_days, team = await self.cog._save_availability(member, list(WEEK_DAYS), None)
+        # Get only active days (not FREE or OFF)
+        day_types = self.cog.config_store.get_all_day_types(interaction.guild.id)
+        active_days = [d for d, t in day_types.items() if t not in ("FREE", "OFF")]
+
+        if not active_days:
+            await interaction.response.send_message(
+                "No active days configured. Ask an admin to set day types.",
+                ephemeral=True
+            )
+            return
+
+        saved_days, team = await self.cog._save_availability(member, active_days, None)
+        pretty_days = ", ".join(d.title() for d in saved_days)
         embed = success_embed(
             "Availability Saved",
             f"**Player:** {member.display_name}\n"
-            f"**Days:** All week (Mon-Sun)\n"
+            f"**Days:** {pretty_days}\n"
             f"**Team:** {team or 'Not assigned'}"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -318,25 +481,15 @@ class AvailabilityViewMineButton(discord.ui.Button):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class AvailabilityPanelView(discord.ui.View):
-    def __init__(self, cog: "AvailabilityCog") -> None:
-        super().__init__(timeout=60 * 60)  # 1 hour timeout
-        self.add_item(AvailabilitySelect(cog))
+class AvailabilityPanelView(PersistentView):
+    def __init__(self, cog: "AvailabilityCog", guild_id: Optional[int] = None) -> None:
+        super().__init__(timeout=3600.0)  # 1 hour timeout
+        self.cog = cog
+        self.guild_id = guild_id
+        self.add_item(AvailabilitySelect(cog, guild_id))
         self.add_item(AvailabilityAllWeekButton(cog))
         self.add_item(AvailabilityViewMineButton(cog))
         self.add_item(AvailabilityClearButton(cog))
-        self.message: Optional[discord.Message] = None
-
-    async def on_timeout(self) -> None:
-        """Disable all components when the view times out."""
-        for item in self.children:
-            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
-                item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
 
 # -------------------------- Agents UI --------------------------
@@ -421,26 +574,14 @@ class AgentSelect(discord.ui.Select):
         )
 
 
-class AgentSelectView(discord.ui.View):
+class AgentSelectView(PersistentView):
     def __init__(self, cog: "AgentsCog") -> None:
-        super().__init__(timeout=300)  # 5 minute timeout
+        super().__init__(timeout=300.0)  # 5 minute timeout
         self.cog = cog
         self.selected_roles: List[str] = []
         self.role_select = AgentRoleSelect(cog)
         self.agent_select: Optional[AgentSelect] = None  # created on demand
         self.add_item(self.role_select)
-        self.message: Optional[discord.Message] = None
-
-    async def on_timeout(self) -> None:
-        """Disable all components when the view times out."""
-        for item in self.children:
-            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
-                item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
     def refresh_agent_options(self) -> None:
         agents: List[str] = []
@@ -472,6 +613,86 @@ class AgentSelectView(discord.ui.View):
 # -------------------------- Cogs --------------------------
 
 
+class ScrimSlotSelect(discord.ui.Select):
+    """Select menu for scrim slot availability."""
+
+    def __init__(self, cog: "AvailabilityCog", guild_id: int, day: str) -> None:
+        self.cog = cog
+        self.guild_id = guild_id
+        self.day = day
+
+        # Get scrim config
+        num_slots = cog.config_store.get_scrims_per_day(guild_id)
+        scrim_time = cog.config_store.get_scrim_time(guild_id, day)
+        spacing = cog.config_store.get_scrim_spacing(guild_id)
+
+        options = []
+        if scrim_time:
+            try:
+                parts = scrim_time.split(":")
+                base_hour = int(parts[0])
+                base_minute = int(parts[1]) if len(parts) > 1 else 0
+
+                for i in range(num_slots):
+                    total_min = base_hour * 60 + base_minute + (i * spacing)
+                    slot_time = f"{(total_min // 60) % 24:02d}:{total_min % 60:02d}"
+                    options.append(discord.SelectOption(
+                        label=f"Scrim #{i+1} @ {slot_time}",
+                        value=str(i + 1),
+                        description=f"Slot {i+1} starting at {slot_time}"
+                    ))
+            except (ValueError, IndexError):
+                pass
+
+        if not options:
+            options.append(discord.SelectOption(
+                label="No scrim slots configured",
+                value="none",
+                description="Ask an admin to configure scrim times"
+            ))
+
+        super().__init__(
+            placeholder=f"Select scrim slots for {day.title()}",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        if "none" in self.values:
+            await interaction.response.send_message(
+                "No scrim slots are configured for this day.", ephemeral=True
+            )
+            return
+
+        slots = [int(v) for v in self.values]
+        self.cog.availability_store.set_scrim_slot_availability(
+            member.id, member.display_name, self.day, slots
+        )
+
+        slot_names = [f"Scrim #{s}" for s in sorted(slots)]
+        embed = success_embed(
+            "Scrim Availability Saved",
+            f"**Player:** {member.display_name}\n"
+            f"**Day:** {self.day.title()}\n"
+            f"**Slots:** {', '.join(slot_names)}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ScrimSlotView(PersistentView):
+    """View for selecting scrim slot availability."""
+
+    def __init__(self, cog: "AvailabilityCog", guild_id: int, day: str) -> None:
+        super().__init__(timeout=300.0)
+        self.add_item(ScrimSlotSelect(cog, guild_id, day))
+
+
 class AvailabilityCog(commands.Cog):
     def __init__(
         self,
@@ -484,6 +705,8 @@ class AvailabilityCog(commands.Cog):
         self.config_store = config_store
 
     availability = app_commands.Group(name="availability", description="Manage Valorant availability")
+    scrim = app_commands.Group(name="scrim", description="Manage scrim slot availability", parent=availability)
+    vod = app_commands.Group(name="vod", description="Manage VOD review availability", parent=availability)
 
     async def _save_availability(
         self, member: discord.Member, days: List[str], team_override: Optional[str]
@@ -588,16 +811,24 @@ class AvailabilityCog(commands.Cog):
             return
 
         # Defer first to avoid "Interaction failed" - channel.send may take time
-        await interaction.response.defer(ephemeral=True)
+        await safe_defer(interaction, ephemeral=True)
+
+        # Get day types info for the description
+        day_types = self.config_store.get_all_day_types(interaction.guild.id)
+        active_days = [d for d, t in day_types.items() if t not in ("FREE", "OFF")]
+
+        if active_days:
+            days_info = f"Active days: {', '.join(d.title() for d in active_days)}"
+        else:
+            days_info = "No active days configured. Ask an admin to set day types."
 
         embed = format_embed(
             "Weekly Signup Panel",
-            (
-                "Pick your days below to save availability quickly. "
-                "Use the clear button to wipe your week and re-select."
-            ),
+            f"Pick your days below to save availability quickly.\n"
+            f"Use the clear button to wipe your week and re-select.\n\n"
+            f"_{days_info}_"
         )
-        view = AvailabilityPanelView(self)
+        view = AvailabilityPanelView(self, interaction.guild.id)
         msg = await interaction.channel.send(embed=embed, view=view)
         view.message = msg  # Store reference for timeout cleanup
         await interaction.followup.send("Signup panel posted!", ephemeral=True)
@@ -622,6 +853,229 @@ class AvailabilityCog(commands.Cog):
             f"Cleared availability for {cleared} players. Fresh week ready!", ephemeral=True
         )
 
+    # -------- Scrim slot availability commands --------
+
+    @scrim.command(name="set", description="Set your availability for scrim slots on a specific day")
+    @app_commands.describe(day="Day to set scrim availability for")
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def scrim_set(
+        self, interaction: discord.Interaction, day: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        # Check if this day supports scrims
+        day_type = self.config_store.get_day_type(interaction.guild.id, day.value)
+        if day_type not in ("SCRIM", "MIXED"):
+            embed = error_embed(
+                "Not a Scrim Day",
+                f"**{day.name}** is configured as **{day_type}** and doesn't support scrims.\n"
+                "Ask an admin to change the day type to SCRIM or MIXED."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        view = ScrimSlotView(self, interaction.guild.id, day.value)
+        await interaction.response.send_message(
+            f"Select which scrim slots you can play on **{day.name}**:",
+            view=view,
+            ephemeral=True,
+        )
+
+    @scrim.command(name="view", description="View your scrim slot availability")
+    async def scrim_view(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        lines = []
+        for day in WEEK_DAYS:
+            slots = self.availability_store.get_scrim_slot_availability(member.id, day)
+            if slots:
+                slot_names = ", ".join(f"#{s}" for s in sorted(slots))
+                lines.append(f"**{day.title()}:** {slot_names}")
+
+        if not lines:
+            embed = format_embed(
+                "Your Scrim Availability",
+                "No scrim slot availability set.\nUse `/availability scrim set` to sign up for specific scrim slots."
+            )
+        else:
+            embed = format_embed(
+                f"Scrim Availability: {member.display_name}",
+                "\n".join(lines)
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @scrim.command(name="clear", description="Clear your scrim slot availability")
+    async def scrim_clear(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.availability_store.clear_scrim_slots(member.id)
+        embed = success_embed(
+            "Scrim Availability Cleared",
+            "All your scrim slot availability has been cleared."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -------- VOD availability commands --------
+
+    @vod.command(name="set", description="Set your availability for VOD review sessions")
+    @app_commands.describe(days="Comma-separated days you can attend VOD review (e.g., sunday, monday)")
+    async def vod_set(self, interaction: discord.Interaction, days: str) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        # Parse days
+        norm_days = parse_days(days)
+        if not norm_days:
+            await interaction.response.send_message(
+                "No valid days provided. Try `sunday, monday`.", ephemeral=True
+            )
+            return
+
+        # Filter to only VOD or MIXED days
+        valid_days = []
+        invalid_days = []
+        for day in norm_days:
+            day_type = self.config_store.get_day_type(interaction.guild.id, day)
+            if day_type in ("VOD", "MIXED"):
+                valid_days.append(day)
+            else:
+                invalid_days.append(day)
+
+        if not valid_days:
+            embed = error_embed(
+                "No Valid VOD Days",
+                f"None of the selected days ({', '.join(d.title() for d in norm_days)}) are configured for VOD.\n"
+                "Ask an admin to set day types to VOD or MIXED."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        self.availability_store.set_vod_availability(
+            member.id, member.display_name, valid_days
+        )
+
+        msg = f"**Player:** {member.display_name}\n**VOD Days:** {', '.join(d.title() for d in valid_days)}"
+        if invalid_days:
+            msg += f"\n\n_Skipped non-VOD days: {', '.join(d.title() for d in invalid_days)}_"
+
+        embed = success_embed("VOD Availability Saved", msg)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @vod.command(name="view", description="View your VOD review availability")
+    async def vod_view(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        days = self.availability_store.get_vod_availability(member.id)
+        if not days:
+            embed = format_embed(
+                "Your VOD Availability",
+                "No VOD availability set.\nUse `/availability vod set` to sign up for VOD review sessions."
+            )
+        else:
+            embed = format_embed(
+                f"VOD Availability: {member.display_name}",
+                f"**Days:** {', '.join(d.title() for d in days)}"
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @vod.command(name="clear", description="Clear your VOD review availability")
+    async def vod_clear(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        self.availability_store.clear_vod_availability(member.id)
+        embed = success_embed(
+            "VOD Availability Cleared",
+            "Your VOD review availability has been cleared."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class DashboardRefreshButton(discord.ui.Button):
+    """Button to refresh the dashboard."""
+
+    def __init__(self, cog: "ScheduleCog") -> None:
+        super().__init__(style=discord.ButtonStyle.primary, label="Refresh", emoji="🔄")
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+        await self.cog._refresh_dashboard(interaction.guild)
+        await interaction.followup.send("Dashboard refreshed!", ephemeral=True)
+
+
+class DashboardViewSelect(discord.ui.Select):
+    """Select menu to change dashboard view mode."""
+
+    def __init__(self, cog: "ScheduleCog", current_mode: str = "all") -> None:
+        self.cog = cog
+        options = [
+            discord.SelectOption(label="All Days", value="all", emoji="📅", default=current_mode == "all"),
+            discord.SelectOption(label="Premier Only", value="premier", emoji="🏆", default=current_mode == "premier"),
+            discord.SelectOption(label="Scrims Only", value="scrim", emoji="⚔️", default=current_mode == "scrim"),
+            discord.SelectOption(label="VOD Only", value="vod", emoji="🎬", default=current_mode == "vod"),
+        ]
+        super().__init__(placeholder="Change view", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            return
+
+        view_mode = self.values[0]
+        await safe_defer(interaction, ephemeral=True)
+
+        title, description = self.cog.schedule_builder.build_dashboard_embed(
+            interaction.guild.id, interaction.guild.name, view_mode
+        )
+        embed = format_embed(title, description)
+        embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')} · View: {view_mode}")
+
+        # Get dashboard message and update it
+        dashboard = self.cog.config_store.get_dashboard(interaction.guild.id)
+        if dashboard:
+            channel = interaction.guild.get_channel(dashboard["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(dashboard["message_id"])
+                    # Update view with new selection
+                    new_view = DashboardView(self.cog, view_mode)
+                    await msg.edit(embed=embed, view=new_view)
+                except discord.NotFound:
+                    pass
+
+        await interaction.followup.send(f"Dashboard view changed to **{view_mode}**!", ephemeral=True)
+
+
+class DashboardView(PersistentView):
+    """View with dashboard controls."""
+
+    def __init__(self, cog: "ScheduleCog", view_mode: str = "all") -> None:
+        super().__init__(timeout=None)  # No timeout for dashboard
+        self.cog = cog
+        self.view_mode = view_mode
+        self.add_item(DashboardRefreshButton(cog))
+        self.add_item(DashboardViewSelect(cog, view_mode))
+
 
 class ScheduleCog(commands.Cog):
     def __init__(
@@ -634,8 +1088,13 @@ class ScheduleCog(commands.Cog):
         self.availability_store = availability_store
         self.config_store = config_store
         self.schedule_builder = ScheduleBuilder(availability_store, config_store)
+        self.dashboard_refresh_task.start()
+
+    def cog_unload(self) -> None:
+        self.dashboard_refresh_task.cancel()
 
     schedule = app_commands.Group(name="schedule", description="Build and post weekly schedules")
+    dashboard = app_commands.Group(name="dashboard", description="Manage schedule dashboard", parent=schedule)
 
     @schedule.command(name="preview", description="Preview the current schedule")
     async def schedule_preview(self, interaction: discord.Interaction) -> None:
@@ -643,10 +1102,13 @@ class ScheduleCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
+        # Defer for potentially long schedule computation
+        await safe_defer(interaction, ephemeral=False)
+
         summaries = self.schedule_builder.build_week(interaction.guild.id)
         text = self.schedule_builder.format_schedule(interaction.guild.name, summaries)
         embed = format_embed("Valorant Weekly Schedule", text)
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @schedule.command(name="post", description="Post the schedule to the announcement channel")
     async def schedule_post(self, interaction: discord.Interaction) -> None:
@@ -756,6 +1218,128 @@ class ScheduleCog(commands.Cog):
         if role:
             return role.mention
         return None
+
+    # -------- Dashboard commands --------
+
+    @dashboard.command(name="post", description="Post a tracked schedule dashboard that auto-updates")
+    async def dashboard_post(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message("Run this in a server channel.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to post a dashboard.", ephemeral=True
+            )
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        # Build and post dashboard
+        title, description = self.schedule_builder.build_dashboard_embed(
+            interaction.guild.id, interaction.guild.name, "all"
+        )
+        embed = format_embed(title, description)
+        embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')} · View: all")
+
+        view = DashboardView(self, "all")
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.followup.send("Dashboard can only be posted in text channels.", ephemeral=True)
+            return
+
+        msg = await interaction.channel.send(embed=embed, view=view)
+
+        # Save dashboard tracking
+        self.config_store.set_dashboard(interaction.guild.id, interaction.channel.id, msg.id)
+
+        await interaction.followup.send(
+            f"Dashboard posted! It will auto-update when availability changes.\n"
+            f"Use the buttons on the dashboard to refresh or change views.",
+            ephemeral=True
+        )
+
+    @dashboard.command(name="refresh", description="Force refresh the tracked dashboard")
+    async def dashboard_refresh(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        success = await self._refresh_dashboard(interaction.guild)
+        if success:
+            await interaction.followup.send("Dashboard refreshed!", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "Could not find the dashboard. Use `/schedule dashboard post` to create a new one.",
+                ephemeral=True
+            )
+
+    @dashboard.command(name="clear", description="Remove dashboard tracking")
+    async def dashboard_clear(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to clear the dashboard.", ephemeral=True
+            )
+            return
+
+        self.config_store.clear_dashboard(interaction.guild.id)
+        embed = success_embed(
+            "Dashboard Cleared",
+            "Dashboard tracking has been removed.\n"
+            "The message will remain but won't auto-update anymore."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _refresh_dashboard(self, guild: discord.Guild, view_mode: str = "all") -> bool:
+        """Refresh the dashboard message for a guild. Returns True if successful."""
+        dashboard = self.config_store.get_dashboard(guild.id)
+        if not dashboard:
+            return False
+
+        channel = guild.get_channel(dashboard["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            return False
+
+        try:
+            msg = await channel.fetch_message(dashboard["message_id"])
+        except discord.NotFound:
+            # Message deleted, clear tracking
+            self.config_store.clear_dashboard(guild.id)
+            return False
+        except discord.HTTPException:
+            return False
+
+        title, description = self.schedule_builder.build_dashboard_embed(guild.id, guild.name, view_mode)
+        embed = format_embed(title, description)
+        embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')} · View: {view_mode}")
+
+        view = DashboardView(self, view_mode)
+        return await safe_edit_message(msg, embed=embed, view=view)
+
+    @tasks.loop(minutes=15)
+    async def dashboard_refresh_task(self) -> None:
+        """Periodically refresh all dashboards."""
+        for guild in self.bot.guilds:
+            dashboard = self.config_store.get_dashboard(guild.id)
+            if dashboard:
+                await self._refresh_dashboard(guild)
+                await asyncio.sleep(1)  # Rate limit protection
+
+    @dashboard_refresh_task.before_loop
+    async def before_dashboard_refresh(self) -> None:
+        await self.bot.wait_until_ready()
 
 
 class ConfigCog(commands.Cog):
@@ -1253,6 +1837,208 @@ class ConfigCog(commands.Cog):
         embed = format_embed("Current Maps", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ----- Scrim slots configuration -----
+
+    @config.command(name="scrim_slots", description="Configure scrim slots per day")
+    @app_commands.describe(
+        slots_per_day="Number of scrim slots per day (1-5)",
+        spacing_minutes="Minutes between scrim slots (30-180)"
+    )
+    async def config_scrim_slots(
+        self,
+        interaction: discord.Interaction,
+        slots_per_day: int,
+        spacing_minutes: int = 90,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to configure scrim slots.", ephemeral=True
+            )
+            return
+
+        # Validate
+        if slots_per_day < 1 or slots_per_day > 5:
+            await interaction.response.send_message(
+                "Slots per day must be between 1 and 5.", ephemeral=True
+            )
+            return
+
+        if spacing_minutes < 30 or spacing_minutes > 180:
+            await interaction.response.send_message(
+                "Spacing must be between 30 and 180 minutes.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_scrims_per_day(interaction.guild.id, slots_per_day)
+        self.config_store.set_scrim_spacing(interaction.guild.id, spacing_minutes)
+
+        embed = success_embed(
+            "Scrim Slots Configured",
+            f"**Slots per day:** {slots_per_day}\n"
+            f"**Spacing:** {spacing_minutes} minutes between slots\n\n"
+            f"_Example: If scrim time is 19:00 with {slots_per_day} slots and {spacing_minutes}min spacing:_\n"
+            + "\n".join(
+                f"• Scrim #{i+1}: `{19 + (i * spacing_minutes) // 60:02d}:{(i * spacing_minutes) % 60:02d}`"
+                for i in range(slots_per_day)
+            )
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @config.command(name="check_scrim_slots", description="Show current scrim slot configuration")
+    async def config_check_scrim_slots(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        slots = self.config_store.get_scrims_per_day(interaction.guild.id)
+        spacing = self.config_store.get_scrim_spacing(interaction.guild.id)
+
+        embed = format_embed(
+            "Scrim Slot Configuration",
+            f"**Slots per day:** {slots}\n"
+            f"**Spacing:** {spacing} minutes\n\n"
+            "_Scrim slots are generated for days with SCRIM or MIXED day type._"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ----- VOD configuration -----
+
+    @config.command(name="vod", description="Configure VOD review sessions")
+    @app_commands.describe(
+        start_time="VOD session start time (HH:MM in 24h, e.g., 19:00)",
+        duration_minutes="Session duration in minutes (30-180)"
+    )
+    async def config_vod(
+        self,
+        interaction: discord.Interaction,
+        start_time: str,
+        duration_minutes: int = 60,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to configure VOD sessions.", ephemeral=True
+            )
+            return
+
+        # Validate time
+        t = _parse_hhmm_to_time(start_time)
+        if t is None:
+            await interaction.response.send_message(
+                "Invalid time format. Use 24h `HH:MM`, e.g. `19:00`.", ephemeral=True
+            )
+            return
+
+        if duration_minutes < 30 or duration_minutes > 180:
+            await interaction.response.send_message(
+                "Duration must be between 30 and 180 minutes.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_vod_start_time(interaction.guild.id, start_time)
+        self.config_store.set_vod_session_minutes(interaction.guild.id, duration_minutes)
+
+        embed = success_embed(
+            "VOD Configuration Updated",
+            f"**Start time:** `{start_time}`\n"
+            f"**Duration:** {duration_minutes} minutes\n\n"
+            "_VOD sessions are shown for days with VOD or MIXED day type._"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @config.command(name="check_vod", description="Show current VOD configuration")
+    async def config_check_vod(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        start_time = self.config_store.get_vod_start_time(interaction.guild.id)
+        duration = self.config_store.get_vod_session_minutes(interaction.guild.id)
+
+        embed = format_embed(
+            "VOD Configuration",
+            f"**Start time:** `{start_time}`\n"
+            f"**Duration:** {duration} minutes\n\n"
+            "_VOD sessions are shown for days with VOD or MIXED day type._"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ----- Guild timezone -----
+
+    @config.command(name="timezone", description="Set the guild's timezone for schedule display")
+    @app_commands.describe(timezone="Timezone for the guild")
+    @app_commands.choices(
+        timezone=[
+            app_commands.Choice(name=label, value=tz) for tz, label in COMMON_TIMEZONES
+        ]
+    )
+    async def config_timezone(
+        self,
+        interaction: discord.Interaction,
+        timezone: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set the guild timezone.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_guild_timezone(interaction.guild.id, timezone.value)
+        embed = success_embed(
+            "Timezone Updated",
+            f"Guild timezone set to **{timezone.name}** (`{timezone.value}`).\n"
+            "All schedule times will be displayed in this timezone."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @config.command(name="captain_role", description="Set the captain role for lineup management permissions")
+    @app_commands.describe(role="Role that can lock lineups and manage schedules")
+    async def config_captain_role(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set the captain role.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_captain_role(interaction.guild.id, role.id)
+        embed = success_embed(
+            "Captain Role Set",
+            f"Captain role set to {role.mention}.\n"
+            f"Members with this role can lock lineups and manage schedules."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 class AgentsCog(commands.Cog):
     """Let players declare the roles/agents they play and inspect team agent comps."""
@@ -1377,7 +2163,7 @@ class AgentsCog(commands.Cog):
 
 class RoleSyncCog(commands.Cog):
     """Keeps the 'available' role in sync with today's availability
-    and handles weekly reset and scrim/practice pre-pings.
+    and handles weekly reset and enhanced reminder system.
     """
 
     def __init__(
@@ -1391,14 +2177,12 @@ class RoleSyncCog(commands.Cog):
         self.config_store = config_store
         self._target_weekday_index: int = self._resolve_reset_weekday()
         self._last_reset_date: Optional[date] = None
-        self._scrim_ping_sent: Dict[int, date] = {}
-        self._practice_ping_sent: Dict[int, date] = {}
         self.role_sync_task.start()
-        self.scrim_ping_task.start()
+        self.reminder_task.start()
 
     def cog_unload(self) -> None:
         self.role_sync_task.cancel()
-        self.scrim_ping_task.cancel()
+        self.reminder_task.cancel()
 
     def _resolve_reset_weekday(self) -> int:
         try:
@@ -1467,135 +2251,163 @@ class RoleSyncCog(commands.Cog):
     async def before_role_sync(self) -> None:
         await self.bot.wait_until_ready()
 
-    # ---- Scrim / practice pre-ping logic ----
+    # ---- Enhanced reminder system ----
 
-    async def _maybe_ping_scrim_for_guild(self, guild: discord.Guild) -> None:
-        today_label = self._resolve_today_label()
-        scrim_time_label = self.config_store.get_scrim_time(guild.id, today_label)
-        if scrim_time_label is None:
-            return
+    def _get_reminder_mention(self, guild: discord.Guild) -> str:
+        """Get the appropriate mention string based on ping style."""
+        ping_style = self.config_store.get_reminder_ping_style(guild.id)
 
-        scrim_time_obj = _parse_hhmm_to_time(scrim_time_label)
-        if scrim_time_obj is None:
-            return
+        if ping_style == "none":
+            return ""
+        elif ping_style == "here":
+            return "@here "
+        else:  # "role"
+            role_id = self._resolve_ping_role_id(guild)
+            if role_id:
+                role = guild.get_role(role_id)
+                if role:
+                    return f"{role.mention} "
+        return ""
 
-        now = datetime.now()
-        if self._scrim_ping_sent.get(guild.id) == now.date():
-            return  # already pinged today
+    async def _send_reminder(
+        self,
+        guild: discord.Guild,
+        reminder_type: str,
+        day: str,
+        time_str: str,
+        hours_before: int,
+        extra_info: str = "",
+    ) -> bool:
+        """Send a reminder if not already sent. Returns True if sent."""
+        # Check if reminders are enabled
+        if not self.config_store.get_reminders_enabled(guild.id):
+            return False
 
-        target_dt = datetime.combine(now.date(), scrim_time_obj)
-        delta = target_dt - now
+        # Build reminder key for dedup
+        today = datetime.now().strftime("%Y-%m-%d")
+        reminder_key = f"{today}_{reminder_type}_{day}_{hours_before}h"
 
-        if not (timedelta(minutes=25) <= delta <= timedelta(minutes=35)):
-            return
+        # Check if already sent
+        if self.config_store.is_reminder_sent(guild.id, reminder_key):
+            return False
 
-        users = self.availability_store.users_for_day(today_label)
-        if not users:
-            return
-
-        team_counts: Dict[str, int] = {"A": 0, "B": 0}
-        for info in users:
-            t = str(info.get("team") or "").upper()
-            if t in team_counts:
-                team_counts[t] += 1
-
-        total = len(users)
-        by_team = any(c >= 5 for c in team_counts.values())
-        by_total = total >= 10
-
-        if not (by_team or by_total):
-            return
-
-        channel_id = self.config_store.get_announcement_channel(guild.id) or ANNOUNCEMENT_CHANNEL_ID_ENV
+        # Get channel
+        channel_id = self.config_store.get_reminder_channel(guild.id)
         if not channel_id:
-            return
+            return False
 
         channel = guild.get_channel(channel_id)
-        if channel is None:
-            return
+        if not isinstance(channel, discord.TextChannel):
+            return False
 
-        role_id = self._resolve_ping_role_id(guild)
-        mention = ""
-        if role_id:
-            role = guild.get_role(role_id)
-            if role:
-                mention = role.mention + " "
+        mention = self._get_reminder_mention(guild)
+
+        # Build message based on type
+        type_icons = {"premier": "🏆", "scrim": "⚔️", "vod": "🎬", "practice": "🎯"}
+        icon = type_icons.get(reminder_type, "📅")
+
+        if hours_before >= 24:
+            time_desc = f"{hours_before // 24} day(s)"
+        else:
+            time_desc = f"{hours_before} hour(s)"
+
+        message = (
+            f"{mention}{icon} **{reminder_type.title()} Reminder**\n"
+            f"**{day.title()}** at `{time_str}` — {time_desc} away!\n"
+            f"{extra_info}"
+        )
 
         try:
-            await channel.send(
-                f"{mention}Scrim is **today** at `{scrim_time_label}` "
-                f"({total} players signed, Team A: {team_counts['A']}, Team B: {team_counts['B']}). "
-                f"This is your 30-minute reminder."
-            )
-            self._scrim_ping_sent[guild.id] = now.date()
-        except discord.HTTPException:
-            logging.warning("Failed to send scrim reminder in %s", guild.name)
+            await channel.send(message)
+            self.config_store.mark_reminder_sent(guild.id, reminder_key)
+            logging.info("Sent %s reminder for %s in %s", reminder_type, day, guild.name)
+            return True
+        except discord.HTTPException as e:
+            logging.warning("Failed to send %s reminder in %s: %s", reminder_type, guild.name, e)
+            return False
 
-    async def _maybe_ping_practice_for_guild(self, guild: discord.Guild) -> None:
-        today_label = self._resolve_today_label()
-        practice_time_label = self.config_store.get_practice_time(guild.id, today_label)
-        if practice_time_label is None:
-            return
-
-        practice_time_obj = _parse_hhmm_to_time(practice_time_label)
-        if practice_time_obj is None:
-            return
-
+    async def _check_reminders_for_guild(self, guild: discord.Guild) -> None:
+        """Check and send any due reminders for a guild."""
         now = datetime.now()
-        if self._practice_ping_sent.get(guild.id) == now.date():
-            return  # already pinged today
+        today_idx = now.weekday()
+        today_label = WEEK_DAYS[today_idx]
 
-        target_dt = datetime.combine(now.date(), practice_time_obj)
-        delta = target_dt - now
+        # Get lead times
+        lead_times = self.config_store.get_reminder_lead_times(guild.id)
 
-        if not (timedelta(minutes=25) <= delta <= timedelta(minutes=35)):
-            return
+        for hours_before in lead_times:
+            # Calculate target time
+            target_time = now + timedelta(hours=hours_before)
+            target_day_idx = target_time.weekday()
+            target_day = WEEK_DAYS[target_day_idx]
 
-        users = self.availability_store.users_for_day(today_label)
-        total = len(users)
-        if total < 5:
-            return
+            # Get day type
+            day_type = self.config_store.get_day_type(guild.id, target_day)
 
-        team_counts: Dict[str, int] = {"A": 0, "B": 0}
-        for info in users:
-            t = str(info.get("team") or "").upper()
-            if t in team_counts:
-                team_counts[t] += 1
+            # Check Premier
+            if day_type in ("PREMIER", "MIXED"):
+                premier_window = self.config_store.get_premier_window(guild.id, target_day)
+                if premier_window:
+                    premier_time = premier_window.split("-")[0] if "-" in premier_window else premier_window
+                    # Check if time matches
+                    if self._time_matches(target_time, premier_time, hours_before):
+                        users = self.availability_store.users_for_day(target_day)
+                        extra = f"**{len(users)}** players signed up"
+                        await self._send_reminder(guild, "premier", target_day, premier_window, hours_before, extra)
 
-        channel_id = self.config_store.get_announcement_channel(guild.id) or ANNOUNCEMENT_CHANNEL_ID_ENV
-        if not channel_id:
-            return
+            # Check Scrim
+            if day_type in ("SCRIM", "MIXED"):
+                scrim_time = self.config_store.get_scrim_time(guild.id, target_day)
+                if scrim_time:
+                    if self._time_matches(target_time, scrim_time, hours_before):
+                        users = self.availability_store.users_for_day(target_day)
+                        extra = f"**{len(users)}** players signed up"
+                        await self._send_reminder(guild, "scrim", target_day, scrim_time, hours_before, extra)
 
-        channel = guild.get_channel(channel_id)
-        if channel is None:
-            return
+            # Check VOD
+            if day_type in ("VOD", "MIXED"):
+                vod_time = self.config_store.get_vod_start_time(guild.id)
+                if vod_time:
+                    if self._time_matches(target_time, vod_time, hours_before):
+                        vod_users = self.availability_store.users_for_vod_day(target_day)
+                        extra = f"**{len(vod_users)}** players signed up for VOD"
+                        await self._send_reminder(guild, "vod", target_day, vod_time, hours_before, extra)
 
-        role_id = self._resolve_ping_role_id(guild)
-        mention = ""
-        if role_id:
-            role = guild.get_role(role_id)
-            if role:
-                mention = role.mention + " "
-
+    def _time_matches(self, target_time: datetime, time_str: str, hours_before: int) -> bool:
+        """Check if target_time approximately matches time_str with given lead time."""
         try:
-            await channel.send(
-                f"{mention}Practice is **today** at `{practice_time_label}` "
-                f"({total} players signed, Team A: {team_counts['A']}, Team B: {team_counts['B']}). "
-                f"This is your 30-minute reminder."
-            )
-            self._practice_ping_sent[guild.id] = now.date()
-        except discord.HTTPException:
-            logging.warning("Failed to send practice reminder in %s", guild.name)
+            parts = time_str.split(":")
+            event_hour = int(parts[0])
+            event_minute = int(parts[1]) if len(parts) > 1 else 0
 
-    @tasks.loop(minutes=5)
-    async def scrim_ping_task(self) -> None:
-        """Check frequently if we are ~30 minutes before today's scrim/practice and ping if ready."""
+            event_dt = target_time.replace(hour=event_hour, minute=event_minute, second=0, microsecond=0)
+
+            # Check if we're within 10 minutes of when the reminder should fire
+            now = datetime.now()
+            reminder_fire_time = event_dt - timedelta(hours=hours_before)
+
+            delta = abs((now - reminder_fire_time).total_seconds())
+            return delta < 600  # Within 10 minutes
+        except (ValueError, IndexError):
+            return False
+
+    @tasks.loop(minutes=10)
+    async def reminder_task(self) -> None:
+        """Check and send reminders for all guilds."""
         for guild in self.bot.guilds:
-            await self._maybe_ping_scrim_for_guild(guild)
-            await self._maybe_ping_practice_for_guild(guild)
+            try:
+                await self._check_reminders_for_guild(guild)
+            except Exception as e:
+                logging.error("Error checking reminders for %s: %s", guild.name, e)
+            await asyncio.sleep(1)  # Rate limit protection
 
-    @scrim_ping_task.before_loop
-    async def before_scrim_ping(self) -> None:
+        # Clean up old reminder records (older than 7 days)
+        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        for guild in self.bot.guilds:
+            self.config_store.clear_old_reminders(guild.id, cutoff)
+
+    @reminder_task.before_loop
+    async def before_reminder_task(self) -> None:
         await self.bot.wait_until_ready()
 
 
@@ -1860,17 +2672,94 @@ class ProfileCog(commands.Cog):
         roles = info.get("roles", [])
         agents = info.get("agents", [])
         tz = info.get("timezone")
+        status = info.get("status", "starter")
+        scrim_slots = info.get("scrim_slots", {})
+        vod_days = info.get("vod_days", [])
+
+        # Format scrim slots
+        scrim_str = "None set"
+        if scrim_slots:
+            parts = []
+            for day, slots in scrim_slots.items():
+                if slots:
+                    parts.append(f"{day.title()}: #{', #'.join(str(s) for s in slots)}")
+            scrim_str = "; ".join(parts) if parts else "None set"
 
         lines = [
             f"**Player:** {member.display_name}",
             f"**Team:** {info.get('team') or 'Not assigned'}",
+            f"**Status:** {status.title()}",
             f"**Available Days:** {', '.join(d.title() for d in days) if days else 'None set'}",
+            f"**Scrim Slots:** {scrim_str}",
+            f"**VOD Days:** {', '.join(d.title() for d in vod_days) if vod_days else 'None set'}",
             f"**Roles:** {', '.join(r.title() for r in roles) if roles else 'Not set'}",
             f"**Agents:** {', '.join(agents) if agents else 'Not set'}",
             f"**Timezone:** {tz or 'Not set (use /profile timezone)'}",
         ]
 
         embed = format_embed(f"Profile: {member.display_name}", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @profile.command(name="status", description="Set your player status (starter/sub/flex)")
+    @app_commands.describe(status="Your team status")
+    @app_commands.choices(
+        status=[
+            app_commands.Choice(name="Starter - Primary roster", value="starter"),
+            app_commands.Choice(name="Sub - Backup/substitute", value="sub"),
+            app_commands.Choice(name="Flex - Can play either role", value="flex"),
+        ]
+    )
+    async def profile_status(
+        self, interaction: discord.Interaction, status: app_commands.Choice[str]
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        self.availability_store.set_player_status(member.id, status.value)
+        embed = success_embed(
+            "Status Updated",
+            f"Your status is now set to **{status.name}**.\n"
+            "This helps captains understand your availability for lineups."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @profile.command(name="role", description="Set your primary Valorant role")
+    @app_commands.describe(role="Your primary role")
+    @app_commands.choices(
+        role=[
+            app_commands.Choice(name="Duelist", value="duelist"),
+            app_commands.Choice(name="Initiator", value="initiator"),
+            app_commands.Choice(name="Controller", value="controller"),
+            app_commands.Choice(name="Sentinel", value="sentinel"),
+        ]
+    )
+    async def profile_role(
+        self, interaction: discord.Interaction, role: app_commands.Choice[str]
+    ) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        # Get current agents and add the role
+        current = self.availability_store.get_user_agents(member.id)
+        roles = set(current.get("roles", []))
+        roles.add(role.value)
+
+        self.availability_store.set_agents(
+            member.id,
+            member.display_name,
+            list(roles),
+            current.get("agents", [])
+        )
+
+        embed = success_embed(
+            "Role Added",
+            f"Added **{role.name}** to your roles.\n"
+            f"Current roles: {', '.join(r.title() for r in roles)}"
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1902,13 +2791,16 @@ class LineupCog(commands.Cog):
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
             return
 
+        # Defer for lineup computation
+        await safe_defer(interaction, ephemeral=True)
+
         # Build with lineup suggestions enabled
         summaries = self.schedule_builder.build_week(interaction.guild.id, include_lineup_suggestions=True)
 
         # Find the day
         day_summary = next((s for s in summaries if s.day == day.value), None)
         if not day_summary:
-            await interaction.response.send_message("Day not found.", ephemeral=True)
+            await interaction.followup.send("Day not found.", ephemeral=True)
             return
 
         if day_summary.total_available < 5:
@@ -1917,13 +2809,13 @@ class LineupCog(commands.Cog):
                 f"Only **{day_summary.total_available}** players available on {day.name}.\n"
                 f"Need at least 5 for a lineup suggestion."
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         suggestion = day_summary.lineup_suggestion
         if not suggestion:
             embed = error_embed("No Suggestion", "Could not generate a lineup suggestion.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         # Format the suggestion
@@ -1942,9 +2834,9 @@ class LineupCog(commands.Cog):
             f"**Suggested Players:**\n" + "\n".join(player_lines),
             color=discord.Color.green() if suggestion.is_complete and suggestion.has_all_roles else discord.Color.orange()
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @lineup.command(name="lock", description="Lock the lineup for a specific day (admin only)")
+    @lineup.command(name="lock", description="Lock the lineup for a specific day (captain/admin)")
     @app_commands.describe(
         day="Day to lock lineup for",
         players="Mention up to 5 players to lock in the lineup"
@@ -1963,16 +2855,13 @@ class LineupCog(commands.Cog):
             return
 
         member = interaction.user
-        if not isinstance(member, discord.Member) or not (
-            member.guild_permissions.manage_guild or member.guild_permissions.administrator
-        ):
+        if not isinstance(member, discord.Member) or not has_captain_permission(member, self.config_store):
             await interaction.response.send_message(
-                "You need Manage Server permission to lock lineups.", ephemeral=True
+                "You need Captain role or Manage Server permission to lock lineups.", ephemeral=True
             )
             return
 
         # Parse player mentions from the string
-        import re
         mention_pattern = r"<@!?(\d+)>"
         matches = re.findall(mention_pattern, players)
 
@@ -2055,7 +2944,7 @@ class LineupCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @lineup.command(name="unlock", description="Unlock/clear the lineup for a day (admin only)")
+    @lineup.command(name="unlock", description="Unlock/clear the lineup for a day (captain/admin)")
     @app_commands.describe(day="Day to unlock lineup for")
     @app_commands.choices(
         day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
@@ -2068,11 +2957,9 @@ class LineupCog(commands.Cog):
             return
 
         member = interaction.user
-        if not isinstance(member, discord.Member) or not (
-            member.guild_permissions.manage_guild or member.guild_permissions.administrator
-        ):
+        if not isinstance(member, discord.Member) or not has_captain_permission(member, self.config_store):
             await interaction.response.send_message(
-                "You need Manage Server permission to unlock lineups.", ephemeral=True
+                "You need Captain role or Manage Server permission to unlock lineups.", ephemeral=True
             )
             return
 
@@ -2082,6 +2969,110 @@ class LineupCog(commands.Cog):
         else:
             embed = format_embed("No Lineup", f"There was no locked lineup for **{day.name}**.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class DayTypeSelect(discord.ui.Select):
+    """Select menu for bulk day type editing."""
+
+    def __init__(self, config_store: GuildConfigStore, guild_id: int) -> None:
+        self.config_store = config_store
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(
+                label=day.title(),
+                value=day,
+                emoji=DAY_EMOJIS.get(day),
+                description=f"Currently: {config_store.get_day_type(guild_id, day)}"
+            )
+            for day in WEEK_DAYS
+        ]
+        super().__init__(
+            placeholder="Select days to edit",
+            min_values=1,
+            max_values=len(WEEK_DAYS),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if isinstance(view, DayTypeBulkView):
+            view.selected_days = list(self.values)
+            # Enable the type selector
+            view.type_select.disabled = False
+            await interaction.response.edit_message(
+                content=f"Selected days: **{', '.join(d.title() for d in self.values)}**\nNow select a day type:",
+                view=view,
+            )
+
+
+class DayTypeTypeSelect(discord.ui.Select):
+    """Select menu for choosing day type."""
+
+    def __init__(self, config_store: GuildConfigStore, guild_id: int) -> None:
+        self.config_store = config_store
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(
+                label=dt,
+                value=dt,
+                emoji=DAY_TYPE_ICONS.get(dt, ""),
+                description=self._get_description(dt),
+            )
+            for dt in DAY_TYPES
+        ]
+        super().__init__(
+            placeholder="Select day type to apply",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=True,
+        )
+
+    @staticmethod
+    def _get_description(dt: str) -> str:
+        descriptions = {
+            "FREE": "No activities - free day",
+            "PREMIER": "Premier match day",
+            "SCRIM": "Scrim practice day",
+            "VOD": "VOD review day",
+            "MIXED": "Multiple activity types",
+            "OFF": "Team day off",
+        }
+        return descriptions.get(dt, "")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, DayTypeBulkView):
+            return
+
+        day_type = self.values[0]
+        changed_days = []
+
+        for day in view.selected_days:
+            self.config_store.set_day_type(self.guild_id, day, day_type)
+            changed_days.append(day.title())
+
+        embed = success_embed(
+            "Day Types Updated",
+            f"Set **{', '.join(changed_days)}** to **{day_type}** {DAY_TYPE_ICONS.get(day_type, '')}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class DayTypeBulkView(PersistentView):
+    """View for bulk editing day types."""
+
+    def __init__(self, config_store: GuildConfigStore, guild_id: int) -> None:
+        super().__init__(timeout=300.0)
+        self.config_store = config_store
+        self.guild_id = guild_id
+        self.selected_days: List[str] = []
+
+        self.day_select = DayTypeSelect(config_store, guild_id)
+        self.type_select = DayTypeTypeSelect(config_store, guild_id)
+
+        self.add_item(self.day_select)
+        self.add_item(self.type_select)
 
 
 class PremierCog(commands.Cog):
@@ -2100,6 +3091,148 @@ class PremierCog(commands.Cog):
         self.log_store = log_store
 
     premier = app_commands.Group(name="premier", description="Premier bot admin commands")
+    days = app_commands.Group(name="days", description="Manage day types", parent=premier)
+
+    # -------- Day Types Commands --------
+
+    @days.command(name="view", description="View current day types for all days")
+    async def days_view(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        lines = []
+        for day in WEEK_DAYS:
+            day_type = self.config_store.get_day_type(interaction.guild.id, day)
+            day_label = self.config_store.get_day_label(interaction.guild.id, day)
+            icon = DAY_TYPE_ICONS.get(day_type, "")
+            label_str = f" — _{day_label}_" if day_label else ""
+            lines.append(f"{icon} **{day.title()}**: {day_type}{label_str}")
+
+        embed = format_embed("Day Types Configuration", "\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @days.command(name="set", description="Set the day type for a specific day")
+    @app_commands.describe(
+        day="Day of the week",
+        day_type="Type of activity for this day"
+    )
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS],
+        day_type=[app_commands.Choice(name=f"{DAY_TYPE_ICONS.get(dt, '')} {dt}", value=dt) for dt in DAY_TYPES]
+    )
+    async def days_set(
+        self,
+        interaction: discord.Interaction,
+        day: app_commands.Choice[str],
+        day_type: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change day types.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_day_type(interaction.guild.id, day.value, day_type.value)
+        icon = DAY_TYPE_ICONS.get(day_type.value, "")
+        embed = success_embed(
+            "Day Type Updated",
+            f"**{day.name}** is now set to **{day_type.value}** {icon}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @days.command(name="bulk", description="Edit multiple day types at once")
+    async def days_bulk(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change day types.", ephemeral=True
+            )
+            return
+
+        view = DayTypeBulkView(self.config_store, interaction.guild.id)
+        await interaction.response.send_message(
+            "Select the days you want to modify:",
+            view=view,
+            ephemeral=True,
+        )
+
+    @days.command(name="reset", description="Reset all day types to defaults")
+    async def days_reset(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to reset day types.", ephemeral=True
+            )
+            return
+
+        self.config_store.reset_day_types(interaction.guild.id)
+        embed = success_embed(
+            "Day Types Reset",
+            "All day types have been reset to defaults."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @days.command(name="label", description="Set a custom label for a day (e.g., 'Gym Day')")
+    @app_commands.describe(
+        day="Day of the week",
+        label="Custom label (leave empty to clear)"
+    )
+    @app_commands.choices(
+        day=[app_commands.Choice(name=d.title(), value=d) for d in WEEK_DAYS]
+    )
+    async def days_label(
+        self,
+        interaction: discord.Interaction,
+        day: app_commands.Choice[str],
+        label: Optional[str] = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to set day labels.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_day_label(interaction.guild.id, day.value, label)
+        if label:
+            embed = success_embed(
+                "Day Label Set",
+                f"**{day.name}** now has the label: _{label}_"
+            )
+        else:
+            embed = success_embed(
+                "Day Label Cleared",
+                f"**{day.name}** label has been cleared."
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # -------- Main Premier Commands --------
 
     @premier.command(name="status", description="Show bot status and configuration summary (admin only)")
     async def premier_status(self, interaction: discord.Interaction) -> None:
@@ -2116,6 +3249,7 @@ class PremierCog(commands.Cog):
             )
             return
 
+        await safe_defer(interaction, ephemeral=True)
         guild_id = interaction.guild.id
 
         # Get configuration summary
@@ -2161,7 +3295,7 @@ class PremierCog(commands.Cog):
         ]
 
         embed = format_embed(f"Premier Bot Status — {interaction.guild.name}", "\n".join(lines))
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @premier.command(name="reminders", description="Enable or disable automatic match reminders")
     @app_commands.describe(enabled="Enable or disable reminders")
@@ -2190,13 +3324,358 @@ class PremierCog(commands.Cog):
         is_enabled = enabled.value == "true"
         self.config_store.set_reminders_enabled(interaction.guild.id, is_enabled)
 
+        lead_times = self.config_store.get_reminder_lead_times(interaction.guild.id)
+        times_str = ", ".join(f"{h}h" for h in lead_times)
+
         status = "enabled" if is_enabled else "disabled"
         embed = success_embed(
             "Reminders Updated",
             f"Automatic match reminders are now **{status}**.\n"
-            "Reminders are sent 30 minutes before scheduled scrims and practices."
+            f"Reminder times: {times_str} before events\n"
+            f"_Use `/premier reminder_times` to change when reminders are sent._"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @premier.command(name="reminder_times", description="Set when reminders are sent (hours before events)")
+    @app_commands.describe(
+        hours="Comma-separated hours before event (e.g., '24,1' for 24h and 1h before)"
+    )
+    async def premier_reminder_times(
+        self, interaction: discord.Interaction, hours: str
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change reminder times.", ephemeral=True
+            )
+            return
+
+        # Parse hours
+        try:
+            hour_list = [int(h.strip()) for h in hours.split(",") if h.strip()]
+            hour_list = [h for h in hour_list if 1 <= h <= 168]  # 1h to 7 days
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid format. Use comma-separated numbers like `24,1` for 24h and 1h.", ephemeral=True
+            )
+            return
+
+        if not hour_list:
+            await interaction.response.send_message(
+                "Please provide at least one valid hour (1-168).", ephemeral=True
+            )
+            return
+
+        self.config_store.set_reminder_lead_times(interaction.guild.id, hour_list)
+
+        times_str = ", ".join(f"{h}h" for h in sorted(hour_list, reverse=True))
+        embed = success_embed(
+            "Reminder Times Updated",
+            f"Reminders will now be sent at: **{times_str}** before events.\n"
+            f"This applies to Premier, Scrim, and VOD reminders."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @premier.command(name="reminder_ping", description="Set how reminders ping (role/@here/none)")
+    @app_commands.describe(style="Ping style for reminders")
+    @app_commands.choices(
+        style=[
+            app_commands.Choice(name="Ping Role", value="role"),
+            app_commands.Choice(name="@here", value="here"),
+            app_commands.Choice(name="No Ping", value="none"),
+        ]
+    )
+    async def premier_reminder_ping(
+        self, interaction: discord.Interaction, style: app_commands.Choice[str]
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to change reminder ping style.", ephemeral=True
+            )
+            return
+
+        self.config_store.set_reminder_ping_style(interaction.guild.id, style.value)
+
+        desc_map = {
+            "role": "the configured ping role",
+            "here": "@here",
+            "none": "no ping"
+        }
+        embed = success_embed(
+            "Reminder Ping Style Updated",
+            f"Reminders will now use **{desc_map[style.value]}**."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @premier.command(name="config", description="View current bot configuration summary")
+    async def premier_config(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        guild_id = interaction.guild.id
+
+        # Gather configuration
+        ann_channel = self.config_store.get_announcement_channel(guild_id)
+        ping_role = self.config_store.get_ping_role(guild_id)
+        captain_role = self.config_store.get_captain_role(guild_id)
+        team_roles = self.config_store.get_team_roles(guild_id)
+        timezone = self.config_store.get_guild_timezone(guild_id)
+        reminders_enabled = self.config_store.get_reminders_enabled(guild_id)
+        lead_times = self.config_store.get_reminder_lead_times(guild_id)
+        ping_style = self.config_store.get_reminder_ping_style(guild_id)
+        scrims_per_day = self.config_store.get_scrims_per_day(guild_id)
+        scrim_spacing = self.config_store.get_scrim_spacing(guild_id)
+        vod_time = self.config_store.get_vod_start_time(guild_id)
+        vod_duration = self.config_store.get_vod_session_minutes(guild_id)
+        dashboard = self.config_store.get_dashboard(guild_id)
+
+        ann_str = f"<#{ann_channel}>" if ann_channel else "Not set"
+        ping_str = f"<@&{ping_role}>" if ping_role else "Not set"
+        captain_str = f"<@&{captain_role}>" if captain_role else "Not set"
+        team_a_str = f"<@&{team_roles['A']}>" if team_roles.get("A") else "Not set"
+        team_b_str = f"<@&{team_roles['B']}>" if team_roles.get("B") else "Not set"
+        dashboard_str = "Active" if dashboard else "Not set"
+
+        lines = [
+            "## Channels & Roles",
+            f"**Announcement Channel:** {ann_str}",
+            f"**Ping Role:** {ping_str}",
+            f"**Captain Role:** {captain_str}",
+            f"**Team A Role:** {team_a_str}",
+            f"**Team B Role:** {team_b_str}",
+            "",
+            "## Schedule Settings",
+            f"**Timezone:** {timezone}",
+            f"**Scrims/Day:** {scrims_per_day} slots",
+            f"**Scrim Spacing:** {scrim_spacing} minutes",
+            f"**VOD Time:** `{vod_time}` ({vod_duration}min)",
+            f"**Dashboard:** {dashboard_str}",
+            "",
+            "## Reminders",
+            f"**Status:** {'Enabled' if reminders_enabled else 'Disabled'}",
+            f"**Lead Times:** {', '.join(f'{h}h' for h in lead_times)}",
+            f"**Ping Style:** {ping_style}",
+        ]
+
+        embed = format_embed(f"Bot Configuration — {interaction.guild.name}", "\n".join(lines))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @premier.command(name="doctor", description="Check bot health and identify configuration issues")
+    async def premier_doctor(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "You need Manage Server permission to run diagnostics.", ephemeral=True
+            )
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        guild_id = interaction.guild.id
+        issues: List[str] = []
+        warnings: List[str] = []
+        good: List[str] = []
+
+        # Check announcement channel
+        ann_channel = self.config_store.get_announcement_channel(guild_id)
+        if not ann_channel:
+            issues.append("⚠️ No announcement channel set — use `/config announcement`")
+        elif not interaction.guild.get_channel(ann_channel):
+            issues.append("❌ Announcement channel not found — update with `/config announcement`")
+        else:
+            good.append("✅ Announcement channel configured")
+
+        # Check ping role
+        ping_role = self.config_store.get_ping_role(guild_id)
+        if not ping_role:
+            warnings.append("⚠️ No ping role set — schedule pings won't mention anyone")
+        elif not interaction.guild.get_role(ping_role):
+            issues.append("❌ Ping role not found — update with `/config pingrole`")
+        else:
+            good.append("✅ Ping role configured")
+
+        # Check day types
+        day_types = self.config_store.get_all_day_types(guild_id)
+        active_days = [d for d, t in day_types.items() if t not in ("FREE", "OFF")]
+        if not active_days:
+            issues.append("⚠️ All days are FREE/OFF — users can't sign up")
+        else:
+            good.append(f"✅ {len(active_days)} active days configured")
+
+        # Check for Premier days without windows
+        for day in WEEK_DAYS:
+            if day_types.get(day) == "PREMIER":
+                window = self.config_store.get_premier_window(guild_id, day)
+                if not window:
+                    warnings.append(f"⚠️ {day.title()} is PREMIER but has no window set")
+
+        # Check for Scrim days without times
+        for day in WEEK_DAYS:
+            if day_types.get(day) in ("SCRIM", "MIXED"):
+                scrim_time = self.config_store.get_scrim_time(guild_id, day)
+                if not scrim_time:
+                    warnings.append(f"⚠️ {day.title()} is {day_types[day]} but has no scrim time")
+
+        # Check dashboard
+        dashboard = self.config_store.get_dashboard(guild_id)
+        if dashboard:
+            channel = interaction.guild.get_channel(dashboard["channel_id"])
+            if not channel:
+                issues.append("❌ Dashboard channel not found — use `/schedule dashboard post`")
+            else:
+                try:
+                    await channel.fetch_message(dashboard["message_id"])
+                    good.append("✅ Dashboard message found")
+                except discord.NotFound:
+                    issues.append("❌ Dashboard message deleted — use `/schedule dashboard post`")
+                except discord.HTTPException:
+                    warnings.append("⚠️ Could not verify dashboard message")
+        else:
+            warnings.append("⚠️ No dashboard configured — use `/schedule dashboard post`")
+
+        # Check availability data
+        all_users = self.availability_store.all_users()
+        users_with_days = sum(1 for u in all_users.values() if u.get("days"))
+        if users_with_days == 0:
+            warnings.append("⚠️ No players have signed up yet")
+        else:
+            good.append(f"✅ {users_with_days} players with availability")
+
+        # Build result
+        lines = []
+        if issues:
+            lines.append("## Issues")
+            lines.extend(issues)
+            lines.append("")
+        if warnings:
+            lines.append("## Warnings")
+            lines.extend(warnings)
+            lines.append("")
+        if good:
+            lines.append("## Good")
+            lines.extend(good)
+
+        if not issues and not warnings:
+            lines.insert(0, "**All systems healthy!** 🎉\n")
+
+        embed = format_embed("Bot Health Check", "\n".join(lines))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @premier.command(name="conflicts", description="Show players missing availability and low-coverage days")
+    async def premier_conflicts(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        guild_id = interaction.guild.id
+        day_types = self.config_store.get_all_day_types(guild_id)
+        active_days = [d for d, t in day_types.items() if t not in ("FREE", "OFF")]
+
+        lines = []
+
+        # Find days with low coverage
+        lines.append("## Coverage by Day")
+        for day in active_days:
+            users = self.availability_store.users_for_day(day)
+            count = len(users)
+            day_type = day_types[day]
+            icon = DAY_TYPE_ICONS.get(day_type, "")
+
+            if count == 0:
+                status = "❌ No signups"
+            elif count < 5:
+                status = f"⚠️ {count}/5 (need {5 - count} more)"
+            elif count < 10 and day_type in ("SCRIM", "MIXED"):
+                status = f"⚠️ {count}/10 for scrims (need {10 - count} more)"
+            else:
+                status = f"✅ {count} players"
+
+            lines.append(f"{icon} **{day.title()}**: {status}")
+
+        lines.append("")
+
+        # Find players without availability
+        lines.append("## Players Without Availability")
+        all_users = self.availability_store.all_users()
+        missing_availability = []
+
+        for user_id, info in all_users.items():
+            # User exists but has no days set
+            if not info.get("days"):
+                name = info.get("display_name", f"Unknown ({user_id})")
+                missing_availability.append(name)
+
+        if missing_availability:
+            if len(missing_availability) <= 10:
+                lines.append(", ".join(missing_availability))
+            else:
+                lines.append(f"{', '.join(missing_availability[:10])} +{len(missing_availability) - 10} more")
+        else:
+            lines.append("_All registered players have availability set_")
+
+        embed = format_embed("Availability Conflicts", "\n".join(lines))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @premier.command(name="export", description="Export schedule as a text block for sharing")
+    async def premier_export(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+
+        await safe_defer(interaction, ephemeral=True)
+
+        summaries = ScheduleBuilder(
+            self.availability_store, self.config_store
+        ).build_week(interaction.guild.id)
+
+        lines = [f"VALORANT SCHEDULE — {interaction.guild.name}", "=" * 40, ""]
+
+        for s in summaries:
+            if s.day_type in ("FREE", "OFF"):
+                lines.append(f"{s.day.upper()}: {s.day_type}")
+            else:
+                lines.append(f"{s.day.upper()} [{s.day_type}]:")
+                if s.premier_window:
+                    lines.append(f"  Premier: {s.premier_window}")
+                if s.scrim_time:
+                    lines.append(f"  Scrim: {s.scrim_time}")
+                if s.vod_session:
+                    lines.append(f"  VOD: {s.vod_session.start_time}")
+                lines.append(f"  Available: {s.total_available} players")
+                if s.available_names:
+                    names = ", ".join(s.available_names[:5])
+                    if len(s.available_names) > 5:
+                        names += f" +{len(s.available_names) - 5} more"
+                    lines.append(f"  Players: {names}")
+            lines.append("")
+
+        text = "\n".join(lines)
+        # Send as code block
+        await interaction.followup.send(f"```\n{text}\n```", ephemeral=True)
 
     @premier.command(name="help", description="Show help information for all Premier bot commands")
     async def premier_help(self, interaction: discord.Interaction) -> None:
@@ -2207,21 +3686,26 @@ class PremierCog(commands.Cog):
 - `/availability mine` - View your current availability
 - `/availability day` - See who's available on specific days
 - `/availability panel` - Post an interactive signup panel
+- `/availability scrim set/view/clear` - Manage scrim slot availability
+- `/availability vod set/view/clear` - Manage VOD availability
 - `/availability resetweek` - Admin: reset all availability
 
 ## Schedule Commands
 - `/schedule preview` - Preview the weekly schedule
 - `/schedule post` - Post schedule to announcement channel
 - `/schedule pingcheck` - Check if ping thresholds are met
+- `/schedule dashboard post/refresh/clear` - Manage auto-updating dashboard
 
 ## Lineup Commands
 - `/lineup suggest` - Get AI-suggested lineup based on roles
-- `/lineup lock` - Admin: lock a lineup for a day
+- `/lineup lock` - Captain: lock a lineup for a day
 - `/lineup view` - View locked lineup for a day
-- `/lineup unlock` - Admin: clear a locked lineup
+- `/lineup unlock` - Captain: clear a locked lineup
 
 ## Profile Commands
 - `/profile timezone` - Set your timezone
+- `/profile status` - Set starter/sub/flex status
+- `/profile role` - Set your Valorant role
 - `/profile view` - View your full profile
 
 ## Agent Commands
@@ -2233,14 +3717,31 @@ class PremierCog(commands.Cog):
 - `/config announcement` - Set announcement channel
 - `/config pingrole` - Set ping role
 - `/config teamroles` - Set team A/B roles
+- `/config captain_role` - Set captain role
+- `/config timezone` - Set guild timezone
 - `/config scrimtime` - Set scrim times
+- `/config scrim_slots` - Configure scrim slots per day
+- `/config vod` - Configure VOD sessions
 - `/config practicetime` - Set practice times
 - `/config premier_window` - Set Premier windows
 - `/config map_*` - Set maps for each day
 
+## Day Types Commands
+- `/premier days view` - View day types
+- `/premier days set` - Set day type for a day
+- `/premier days bulk` - Edit multiple days
+- `/premier days label` - Set custom day label
+- `/premier days reset` - Reset to defaults
+
 ## Admin Commands
-- `/premier status` - View bot configuration
-- `/premier reminders` - Toggle automatic reminders
+- `/premier status` - View bot statistics
+- `/premier config` - View full configuration
+- `/premier doctor` - Check bot health
+- `/premier conflicts` - Find availability gaps
+- `/premier export` - Export schedule as text
+- `/premier reminders` - Toggle reminders
+- `/premier reminder_times` - Set reminder lead times
+- `/premier reminder_ping` - Set reminder ping style
 """
         embed = format_embed("Premier Bot Help", help_text)
         await interaction.response.send_message(embed=embed, ephemeral=True)
