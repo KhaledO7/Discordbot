@@ -6,7 +6,14 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Any
+
+# Schema version for data migrations
+STORAGE_SCHEMA_VERSION = 2
+
+# Day types for scheduling
+DAY_TYPES = ["FREE", "PREMIER", "SCRIM", "VOD", "MIXED", "OFF"]
+DEFAULT_DAY_TYPE = "MIXED"  # Most flexible default
 
 
 def _atomic_write(path: Path, data: Dict) -> None:
@@ -84,6 +91,27 @@ DEFAULT_PREMIER_WINDOWS: Dict[str, Optional[str]] = {
 DEFAULT_PRACTICE_TIMES: Dict[str, Optional[str]] = {
     day: None for day in WEEK_DAYS
 }
+
+# Default day types - MIXED allows all activity types
+DEFAULT_DAY_TYPES: Dict[str, str] = {
+    "monday": "FREE",
+    "tuesday": "FREE",
+    "wednesday": "PREMIER",
+    "thursday": "SCRIM",
+    "friday": "PREMIER",
+    "saturday": "SCRIM",
+    "sunday": "VOD",
+}
+
+# Default scrim slot configuration
+DEFAULT_SCRIMS_PER_DAY = 2
+DEFAULT_SCRIM_SPACING_MINUTES = 90
+
+# Default VOD configuration
+DEFAULT_VOD_SESSION_MINUTES = 60
+
+# Default reminder lead times (hours before event)
+DEFAULT_REMINDER_LEAD_TIMES = [24, 1]  # 24h and 1h before
 
 
 class AvailabilityStore:
@@ -257,7 +285,126 @@ class AvailabilityStore:
             "roles": list(entry.get("roles", [])),
             "agents": list(entry.get("agents", [])),
             "timezone": entry.get("timezone"),
+            "scrim_slots": dict(entry.get("scrim_slots", {})),
+            "vod_days": list(entry.get("vod_days", [])),
+            "status": entry.get("status", "starter"),  # starter/sub/flex
         }
+
+    # -------- Scrim slot availability --------
+
+    def set_scrim_slot_availability(
+        self,
+        user_id: int,
+        display_name: str,
+        day: str,
+        slots: List[int],
+    ) -> None:
+        """Set scrim slot availability for a user on a specific day.
+
+        Args:
+            user_id: The user's ID
+            display_name: The user's display name
+            day: The day of the week
+            slots: List of slot numbers (1-indexed) the user is available for
+        """
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.setdefault(key, {})
+        entry["display_name"] = display_name
+        scrim_slots = entry.setdefault("scrim_slots", {})
+        # Dedupe and sort slots
+        scrim_slots[day.lower()] = sorted(set(slots))
+        self._persist()
+
+    def get_scrim_slot_availability(self, user_id: int, day: str) -> List[int]:
+        """Get scrim slot availability for a user on a specific day."""
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        return list(entry.get("scrim_slots", {}).get(day.lower(), []))
+
+    def users_for_scrim_slot(self, day: str, slot: int) -> List[Dict[str, object]]:
+        """Get all users available for a specific scrim slot on a day."""
+        day = day.lower()
+        users = self._data.get("users", {})
+        return [
+            {
+                "id": int(user_id),
+                "display_name": info.get("display_name", "Unknown"),
+                "team": info.get("team"),
+            }
+            for user_id, info in users.items()
+            if slot in info.get("scrim_slots", {}).get(day, [])
+        ]
+
+    def clear_scrim_slots(self, user_id: int) -> None:
+        """Clear all scrim slot availability for a user."""
+        users = self._data.get("users", {})
+        key = str(user_id)
+        entry = users.get(key)
+        if entry:
+            entry["scrim_slots"] = {}
+            self._persist()
+
+    # -------- VOD availability --------
+
+    def set_vod_availability(
+        self,
+        user_id: int,
+        display_name: str,
+        days: Iterable[str],
+    ) -> None:
+        """Set VOD review availability for a user."""
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.setdefault(key, {})
+        entry["display_name"] = display_name
+        # Dedupe and normalize
+        entry["vod_days"] = sorted({d.lower() for d in days if d.lower() in WEEK_DAYS})
+        self._persist()
+
+    def get_vod_availability(self, user_id: int) -> List[str]:
+        """Get VOD review days for a user."""
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        return list(entry.get("vod_days", []))
+
+    def users_for_vod_day(self, day: str) -> List[Dict[str, object]]:
+        """Get all users available for VOD review on a specific day."""
+        day = day.lower()
+        users = self._data.get("users", {})
+        return [
+            {
+                "id": int(user_id),
+                "display_name": info.get("display_name", "Unknown"),
+                "team": info.get("team"),
+            }
+            for user_id, info in users.items()
+            if day in info.get("vod_days", [])
+        ]
+
+    def clear_vod_availability(self, user_id: int) -> None:
+        """Clear VOD availability for a user."""
+        users = self._data.get("users", {})
+        key = str(user_id)
+        entry = users.get(key)
+        if entry:
+            entry["vod_days"] = []
+            self._persist()
+
+    # -------- Player status (starter/sub/flex) --------
+
+    def set_player_status(self, user_id: int, status: str) -> None:
+        """Set player status: 'starter', 'sub', or 'flex'."""
+        if status not in ("starter", "sub", "flex"):
+            raise ValueError(f"Invalid status: {status}")
+        users = self._data.setdefault("users", {})
+        key = str(user_id)
+        entry = users.setdefault(key, {})
+        entry["status"] = status
+        self._persist()
+
+    def get_player_status(self, user_id: int) -> str:
+        """Get player status. Default is 'starter'."""
+        entry = self._data.get("users", {}).get(str(user_id), {})
+        return entry.get("status", "starter")
 
 
 class GuildConfigStore:
@@ -289,23 +436,59 @@ class GuildConfigStore:
         gid = str(guild_id)
         if gid not in self._data:
             self._data[gid] = {
+                "schema_version": STORAGE_SCHEMA_VERSION,
                 "announcement_channel_id": None,
                 "ping_role_id": None,
                 "team_a_role_id": None,
                 "team_b_role_id": None,
+                "captain_role_id": None,
+                "guild_timezone": "America/New_York",
                 "scrim_times": {d: DEFAULT_SCRIM_TIMES[d] for d in WEEK_DAYS},
                 "premier_windows": {d: DEFAULT_PREMIER_WINDOWS[d] for d in WEEK_DAYS},
                 "practice_times": {d: DEFAULT_PRACTICE_TIMES[d] for d in WEEK_DAYS},
                 "scrim_maps": {d: None for d in WEEK_DAYS},
                 "premier_maps": {d: None for d in WEEK_DAYS},
                 "practice_maps": {d: None for d in WEEK_DAYS},
+                # Day Types system
+                "day_types": {d: DEFAULT_DAY_TYPES[d] for d in WEEK_DAYS},
+                "day_labels": {d: None for d in WEEK_DAYS},
+                # Scrim slots config
+                "scrims_per_day": DEFAULT_SCRIMS_PER_DAY,
+                "scrim_spacing_minutes": DEFAULT_SCRIM_SPACING_MINUTES,
+                # VOD config
+                "vod_start_time": "19:00",
+                "vod_session_minutes": DEFAULT_VOD_SESSION_MINUTES,
+                # Dashboard tracking
+                "dashboard_channel_id": None,
+                "dashboard_message_id": None,
+                # Reminder config
+                "reminder_lead_times": DEFAULT_REMINDER_LEAD_TIMES.copy(),
+                "reminder_ping_style": "role",  # "role", "here", "none"
+                "reminders_enabled": True,
+                # Locked lineups
+                "locked_lineups": {},
+                # Sent reminders tracking
+                "sent_reminders": {},
             }
         else:
             g = self._data[gid]
+            # Migrate schema if needed
+            self._migrate_guild_schema(g)
+        return self._data[gid]
+
+    def _migrate_guild_schema(self, g: Dict[str, Any]) -> None:
+        """Migrate guild config to latest schema version."""
+        current_version = g.get("schema_version", 1)
+
+        if current_version < 2:
+            # Migration to v2: Add new fields
+            g.setdefault("schema_version", STORAGE_SCHEMA_VERSION)
             g.setdefault("announcement_channel_id", None)
             g.setdefault("ping_role_id", None)
             g.setdefault("team_a_role_id", None)
             g.setdefault("team_b_role_id", None)
+            g.setdefault("captain_role_id", None)
+            g.setdefault("guild_timezone", "America/New_York")
 
             scrim = g.setdefault("scrim_times", {})
             premier = g.setdefault("premier_windows", {})
@@ -321,7 +504,38 @@ class GuildConfigStore:
                 scrim_maps.setdefault(d, None)
                 premier_maps.setdefault(d, None)
                 practice_maps.setdefault(d, None)
-        return self._data[gid]
+
+            # Day Types system
+            day_types = g.setdefault("day_types", {})
+            day_labels = g.setdefault("day_labels", {})
+            for d in WEEK_DAYS:
+                day_types.setdefault(d, DEFAULT_DAY_TYPES[d])
+                day_labels.setdefault(d, None)
+
+            # Scrim slots config
+            g.setdefault("scrims_per_day", DEFAULT_SCRIMS_PER_DAY)
+            g.setdefault("scrim_spacing_minutes", DEFAULT_SCRIM_SPACING_MINUTES)
+
+            # VOD config
+            g.setdefault("vod_start_time", "19:00")
+            g.setdefault("vod_session_minutes", DEFAULT_VOD_SESSION_MINUTES)
+
+            # Dashboard tracking
+            g.setdefault("dashboard_channel_id", None)
+            g.setdefault("dashboard_message_id", None)
+
+            # Reminder config
+            g.setdefault("reminder_lead_times", DEFAULT_REMINDER_LEAD_TIMES.copy())
+            g.setdefault("reminder_ping_style", "role")
+            g.setdefault("reminders_enabled", True)
+
+            # Locked lineups
+            g.setdefault("locked_lineups", {})
+
+            # Sent reminders tracking
+            g.setdefault("sent_reminders", {})
+
+            g["schema_version"] = STORAGE_SCHEMA_VERSION
 
     # Announcement channel
     def set_announcement_channel(self, guild_id: int, channel_id: int) -> None:
@@ -560,6 +774,201 @@ class GuildConfigStore:
         """Check if reminders are enabled. Default True."""
         g = self._ensure_guild(guild_id)
         return g.get("reminders_enabled", True)
+
+    # -------- Day Types configuration --------
+
+    def set_day_type(self, guild_id: int, day: str, day_type: str) -> None:
+        """Set the day type for a specific day."""
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        if day_type not in DAY_TYPES:
+            raise ValueError(f"Invalid day type: {day_type}")
+        g["day_types"][day] = day_type
+        self._persist()
+
+    def get_day_type(self, guild_id: int, day: str) -> str:
+        """Get the day type for a specific day."""
+        g = self._ensure_guild(guild_id)
+        return g.get("day_types", {}).get(day.lower(), DEFAULT_DAY_TYPE)
+
+    def get_all_day_types(self, guild_id: int) -> Dict[str, str]:
+        """Get all day types for the guild."""
+        g = self._ensure_guild(guild_id)
+        return dict(g.get("day_types", {}))
+
+    def reset_day_types(self, guild_id: int) -> None:
+        """Reset all day types to defaults."""
+        g = self._ensure_guild(guild_id)
+        g["day_types"] = {d: DEFAULT_DAY_TYPES[d] for d in WEEK_DAYS}
+        self._persist()
+
+    def set_day_label(self, guild_id: int, day: str, label: Optional[str]) -> None:
+        """Set a custom label for a day (e.g., 'Gym Day')."""
+        g = self._ensure_guild(guild_id)
+        day = day.lower()
+        if day not in WEEK_DAYS:
+            raise ValueError(f"Invalid day: {day}")
+        g["day_labels"][day] = label
+        self._persist()
+
+    def get_day_label(self, guild_id: int, day: str) -> Optional[str]:
+        """Get the custom label for a day."""
+        g = self._ensure_guild(guild_id)
+        return g.get("day_labels", {}).get(day.lower())
+
+    # -------- Scrim slots configuration --------
+
+    def set_scrims_per_day(self, guild_id: int, count: int) -> None:
+        """Set number of scrim slots per day (1-5)."""
+        g = self._ensure_guild(guild_id)
+        g["scrims_per_day"] = max(1, min(5, count))
+        self._persist()
+
+    def get_scrims_per_day(self, guild_id: int) -> int:
+        """Get number of scrim slots per day."""
+        g = self._ensure_guild(guild_id)
+        return g.get("scrims_per_day", DEFAULT_SCRIMS_PER_DAY)
+
+    def set_scrim_spacing(self, guild_id: int, minutes: int) -> None:
+        """Set spacing between scrim slots in minutes."""
+        g = self._ensure_guild(guild_id)
+        g["scrim_spacing_minutes"] = max(30, min(180, minutes))
+        self._persist()
+
+    def get_scrim_spacing(self, guild_id: int) -> int:
+        """Get spacing between scrim slots in minutes."""
+        g = self._ensure_guild(guild_id)
+        return g.get("scrim_spacing_minutes", DEFAULT_SCRIM_SPACING_MINUTES)
+
+    # -------- VOD configuration --------
+
+    def set_vod_start_time(self, guild_id: int, time_str: str) -> None:
+        """Set the VOD session start time."""
+        g = self._ensure_guild(guild_id)
+        g["vod_start_time"] = time_str
+        self._persist()
+
+    def get_vod_start_time(self, guild_id: int) -> str:
+        """Get the VOD session start time."""
+        g = self._ensure_guild(guild_id)
+        return g.get("vod_start_time", "19:00")
+
+    def set_vod_session_minutes(self, guild_id: int, minutes: int) -> None:
+        """Set VOD session length in minutes."""
+        g = self._ensure_guild(guild_id)
+        g["vod_session_minutes"] = max(30, min(180, minutes))
+        self._persist()
+
+    def get_vod_session_minutes(self, guild_id: int) -> int:
+        """Get VOD session length in minutes."""
+        g = self._ensure_guild(guild_id)
+        return g.get("vod_session_minutes", DEFAULT_VOD_SESSION_MINUTES)
+
+    # -------- Dashboard tracking --------
+
+    def set_dashboard(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        """Set the tracked dashboard message."""
+        g = self._ensure_guild(guild_id)
+        g["dashboard_channel_id"] = channel_id
+        g["dashboard_message_id"] = message_id
+        self._persist()
+
+    def get_dashboard(self, guild_id: int) -> Optional[Dict[str, int]]:
+        """Get the tracked dashboard channel and message IDs."""
+        g = self._ensure_guild(guild_id)
+        ch = g.get("dashboard_channel_id")
+        msg = g.get("dashboard_message_id")
+        if ch and msg:
+            return {"channel_id": int(ch), "message_id": int(msg)}
+        return None
+
+    def clear_dashboard(self, guild_id: int) -> None:
+        """Clear the tracked dashboard."""
+        g = self._ensure_guild(guild_id)
+        g["dashboard_channel_id"] = None
+        g["dashboard_message_id"] = None
+        self._persist()
+
+    # -------- Guild timezone --------
+
+    def set_guild_timezone(self, guild_id: int, timezone: str) -> None:
+        """Set the guild's timezone."""
+        g = self._ensure_guild(guild_id)
+        g["guild_timezone"] = timezone
+        self._persist()
+
+    def get_guild_timezone(self, guild_id: int) -> str:
+        """Get the guild's timezone."""
+        g = self._ensure_guild(guild_id)
+        return g.get("guild_timezone", "America/New_York")
+
+    # -------- Captain role --------
+
+    def set_captain_role(self, guild_id: int, role_id: int) -> None:
+        """Set the captain role for permission gating."""
+        g = self._ensure_guild(guild_id)
+        g["captain_role_id"] = role_id
+        self._persist()
+
+    def get_captain_role(self, guild_id: int) -> Optional[int]:
+        """Get the captain role ID."""
+        g = self._ensure_guild(guild_id)
+        rid = g.get("captain_role_id")
+        return int(rid) if isinstance(rid, int) else None
+
+    # -------- Reminder configuration --------
+
+    def set_reminder_lead_times(self, guild_id: int, hours: List[int]) -> None:
+        """Set the reminder lead times in hours."""
+        g = self._ensure_guild(guild_id)
+        g["reminder_lead_times"] = sorted(set(hours), reverse=True)
+        self._persist()
+
+    def get_reminder_lead_times(self, guild_id: int) -> List[int]:
+        """Get the reminder lead times in hours."""
+        g = self._ensure_guild(guild_id)
+        return list(g.get("reminder_lead_times", DEFAULT_REMINDER_LEAD_TIMES))
+
+    def set_reminder_ping_style(self, guild_id: int, style: str) -> None:
+        """Set the reminder ping style: 'role', 'here', or 'none'."""
+        g = self._ensure_guild(guild_id)
+        if style not in ("role", "here", "none"):
+            raise ValueError(f"Invalid ping style: {style}")
+        g["reminder_ping_style"] = style
+        self._persist()
+
+    def get_reminder_ping_style(self, guild_id: int) -> str:
+        """Get the reminder ping style."""
+        g = self._ensure_guild(guild_id)
+        return g.get("reminder_ping_style", "role")
+
+    # -------- Sent reminders tracking --------
+
+    def mark_reminder_sent(self, guild_id: int, reminder_key: str) -> None:
+        """Mark a reminder as sent to prevent duplicates on restart."""
+        g = self._ensure_guild(guild_id)
+        sent = g.setdefault("sent_reminders", {})
+        sent[reminder_key] = datetime.now().isoformat(timespec="seconds")
+        self._persist()
+
+    def is_reminder_sent(self, guild_id: int, reminder_key: str) -> bool:
+        """Check if a reminder was already sent."""
+        g = self._ensure_guild(guild_id)
+        sent = g.get("sent_reminders", {})
+        return reminder_key in sent
+
+    def clear_old_reminders(self, guild_id: int, before_date: str) -> int:
+        """Clear reminder records older than a date. Returns count cleared."""
+        g = self._ensure_guild(guild_id)
+        sent = g.get("sent_reminders", {})
+        old_keys = [k for k, v in sent.items() if k.split("_")[0] < before_date]
+        for k in old_keys:
+            del sent[k]
+        if old_keys:
+            self._persist()
+        return len(old_keys)
 
 
 class GameLogStore:
