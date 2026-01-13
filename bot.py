@@ -112,6 +112,22 @@ ROLE_AGENTS: Dict[str, List[str]] = {
     ],
 }
 
+# Common timezones for the dropdown
+COMMON_TIMEZONES = [
+    ("US/Eastern", "Eastern Time (ET)"),
+    ("US/Central", "Central Time (CT)"),
+    ("US/Mountain", "Mountain Time (MT)"),
+    ("US/Pacific", "Pacific Time (PT)"),
+    ("Europe/London", "London (GMT/BST)"),
+    ("Europe/Paris", "Central European (CET)"),
+    ("Europe/Berlin", "Berlin (CET)"),
+    ("Asia/Tokyo", "Tokyo (JST)"),
+    ("Asia/Seoul", "Seoul (KST)"),
+    ("Australia/Sydney", "Sydney (AEST)"),
+    ("America/Sao_Paulo", "Sao Paulo (BRT)"),
+    ("UTC", "UTC"),
+]
+
 
 def normalize_day(day: str) -> Optional[str]:
     day = day.strip().lower()
@@ -2609,23 +2625,6 @@ class GameLogCog(commands.Cog):
 
         embed = format_embed("Recent logged matches", "\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# Common timezones for the dropdown
-COMMON_TIMEZONES = [
-    ("US/Eastern", "Eastern Time (ET)"),
-    ("US/Central", "Central Time (CT)"),
-    ("US/Mountain", "Mountain Time (MT)"),
-    ("US/Pacific", "Pacific Time (PT)"),
-    ("Europe/London", "London (GMT/BST)"),
-    ("Europe/Paris", "Central European (CET)"),
-    ("Europe/Berlin", "Berlin (CET)"),
-    ("Asia/Tokyo", "Tokyo (JST)"),
-    ("Asia/Seoul", "Seoul (KST)"),
-    ("Australia/Sydney", "Sydney (AEST)"),
-    ("America/Sao_Paulo", "Sao Paulo (BRT)"),
-    ("UTC", "UTC"),
-]
 
 
 class ProfileCog(commands.Cog):
